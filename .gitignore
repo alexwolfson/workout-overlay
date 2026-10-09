@@ -1,0 +1,34 @@
+# Virtual environments
+dashboard-env/
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Media and activity data
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.fit
+*.gpx
+
+# Outputs / temp
+workout_overlay*.mp4
+dashboard_*.mp4
+*_output.mp4
+temp_*
+*.TEMP_MPY*
+*.wav
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*~
