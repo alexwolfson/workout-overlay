@@ -5,6 +5,9 @@
 Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
 Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions.
 
+<img width="1931" height="1194" alt="Screenshot_2026-10-09_16-58-32" src="https://github.com/user-attachments/assets/2f17610c-0349-44d3-9c2a-2d8c9ad54cb3" />
+
+
 ## Features
 
 - **Single clip** or **batch folder** (one `.fit` + many videos/photos)
