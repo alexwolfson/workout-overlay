@@ -1,4 +1,6 @@
 #!/bin/bash
+# Copyright (c) 2026 Alex Wolfson
+# SPDX-License-Identifier: MIT
 set -e
 
 if [ -f "$HOME/dashboard-env/bin/activate" ]; then
@@ -6,6 +8,7 @@ if [ -f "$HOME/dashboard-env/bin/activate" ]; then
   source "$HOME/dashboard-env/bin/activate"
 else
   echo "Error: virtualenv not found at ~/dashboard-env"
+  echo "Run ./install_overlay.sh first."
   exit 1
 fi
 
@@ -20,18 +23,14 @@ if [ $# -lt 1 ]; then
   echo "  ./run_overlay.sh --batch ./folder [options]"
   echo ""
   echo "Options:"
-  echo "  --preview           Render at 1080p (faster)"
-  echo "  -o FILE             Output MP4 name"
-  echo "  --factor N          Hyperlapse factor for silent sections (default: 15)"
+  echo "  --preview              Render at 1080p (faster)"
+  echo "  -o FILE                Output MP4 name"
+  echo "  --factor N             Hyperlapse factor for silent sections (default: 15)"
+  echo "  --photo-seconds N      Seconds per photo in batch (default: 3)"
+  echo "  --transition-seconds N Fade through black (extra time, default: 0)"
   echo "  --time auto|local|utc"
-  echo "  --utc-offset HOURS  Manual display timezone offset"
-  echo "  --no-auto-align     Disable auto FIT alignment"
-  echo ""
-  echo "Examples:"
-  echo "  ./run_overlay.sh ride.mp4 ride.fit --preview"
-  echo "  ./run_overlay.sh ride.mp4 ride.fit --factor 10 --preview"
-  echo "  ./run_overlay.sh --batch ../testride1x/ --preview -o batch.mp4"
-  echo "  ./run_overlay.sh --batch ../testride1x/ --factor 15 -o batch.mp4"
+  echo "  --utc-offset HOURS"
+  echo "  --no-auto-align"
   exit 1
 fi
 

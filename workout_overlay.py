@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Alex Wolfson
+# SPDX-License-Identifier: MIT
 """
 Workout Overlay
 Overlay Amazfit/Zepp FIT telemetry onto video (bike, run, dive clips).
