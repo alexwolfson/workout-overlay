@@ -1,6 +1,6 @@
 # Workout Overlay
-
 **Version 1.0**
+v1.0 — DJI + Zepp FIT on Linux
 
 Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
 Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions.
@@ -130,5 +130,4 @@ Not in 1.0 (possible later):
 - Cadence / temperature rows when present  
 
 ## License
-
-Use and modify for personal projects as you like.
+MIT
