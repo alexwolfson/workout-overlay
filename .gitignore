@@ -1,34 +1,45 @@
-# Virtual environments
-dashboard-env/
-.venv/
-venv/
-env/
-
 # Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-.pytest_cache/
-.mypy_cache/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+dashboard-env/
 
-# Media and activity data
+# Env / secrets
+.env
+.env.*
+
+# Media and workout data (do not commit)
 *.mp4
+*.MP4
 *.mov
-*.avi
-*.mkv
+*.MOV
 *.fit
-*.gpx
+*.FIT
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.PNG
+*.webp
 
 # Outputs / temp
+*_batch*.mp4
 workout_overlay*.mp4
-dashboard_*.mp4
-*_output.mp4
-temp_*
-*.TEMP_MPY*
-*.wav
+walk_*.mp4
+preview_*.mp4
+tmp/
+temp/
+.cache/
 
-# Editor / OS
-.vscode/
-.idea/
+# OS / editor
 .DS_Store
-*~
+Thumbs.db
+*.swp
+.idea/
+.vscode/

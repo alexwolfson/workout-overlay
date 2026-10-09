@@ -1,6 +1,6 @@
 # Workout Overlay
-**Version 1.0**
-v1.0 — DJI + Zepp FIT on Linux
+
+**Version 1.0** — DJI Osmo + Zepp/Amazfit FIT on Linux
 
 Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
 Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions.
@@ -21,8 +21,8 @@ Built for real outings: one workout FIT, many Osmo (or phone) clips, photos take
 
 - Linux (tested on Pop!_OS)
 - Python 3.10+
-- `ffmpeg` / `ffprobe`
-- Virtualenv packages: `fitparse`, `opencv-python`, `numpy`, `pillow`, `librosa`, `soundfile`
+- `ffmpeg` / `ffprobe` on `PATH`
+- Python packages listed in `requirements.txt`
 
 ## Setup
 
@@ -32,6 +32,14 @@ chmod +x install_overlay.sh run_overlay.sh
 ```
 
 Creates `~/dashboard-env` and installs dependencies.
+
+Manual alternative:
+
+```bash
+python3 -m venv ~/dashboard-env
+source ~/dashboard-env/bin/activate
+pip install -r requirements.txt
+```
 
 ## Usage
 
@@ -107,27 +115,54 @@ Quiet 1× audio (e.g. mic noise cancellation) can be mistaken for hyperlapse. Fo
 workout_overlay.py   # main tool
 run_overlay.sh       # activates venv, forwards args
 install_overlay.sh   # one-time setup
+requirements.txt
+LICENSE              # MIT
 README.md
 .gitignore
 ```
 
 ## Version 1.0 scope
 
-Included:
+**Supported today**
 
-- Single + batch pipelines  
-- Auto-align, hyperlapse factor, photo EXIF align  
-- Mid-clip photo insertion  
-- Fade-through-black transitions  
-- Preview / full quality  
+- Linux CLI
+- DJI Osmo-style MP4/JPG + phone stills
+- Zepp / Amazfit (and typical FIT) activity files
+- Single + batch pipelines, auto-align, mid-clip photos, fade transitions
 
-Not in 1.0 (possible later):
+**Not in 1.0**
 
-- Real map tiles under the minimap  
-- FIT GPS → timezone for travel (e.g. Eilat processed at home)  
-- Auto-detect hyperlapse factor from FIT duration  
-- Multiple FIT files per folder  
-- Cadence / temperature rows when present  
+- Official Windows/macOS support (may work; not tested)
+- GoPro / other camera profiles
+- Garmin / Apple Watch first-class loaders
+- GUI
+- Dive-specific UI (depth, water temp)
+- Map tiles under the minimap
+
+## Roadmap
+
+Ordered for stability first (CLI/API before GUI):
+
+1. **Device profiles** — thin adapters for video start time and activity load (DJI first; GoPro 11 next candidate).
+2. **Workout / sport defaults** — walk, run, bike, freedive, scuba (fields and sensible `--factor` defaults; dive metrics later).
+3. **Cross-platform GUI** — simple wrapper (folder, options, log) on Linux / Windows / macOS once CLI flags are stable.
+4. **Extras** — FIT GPS → timezone for travel processing, cadence/temperature when present, optional map tiles.
+
+Contributions that follow this direction are welcome once the repo is public.
+
+## Contributing
+
+- Keep media and personal FIT/video files out of git (see `.gitignore`).
+- Prefer small PRs: one profile, one bugfix, or docs.
+- Test on a short clip before a full batch.
+- For new cameras, implement start-time detection first; full telemetry-from-camera is optional.
+
+
+## Acknowledgments
+
+This project was developed with assistance from [Grok](https://grok.x.ai) (xAI).  
+Design decisions, testing, and maintenance are by the project author.
 
 ## License
-MIT
+
+MIT — see [LICENSE](LICENSE).
