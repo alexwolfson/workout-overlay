@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 Alex Wolfson
-# SPDX-License-Identifier: MIT
 """
 Workout Overlay
 Overlay Amazfit/Zepp FIT telemetry onto video (bike, run, dive clips).
@@ -459,23 +457,24 @@ def make_overlay_rgba_values(speed, hr, elev, dist, lat, lon, ts,
             f"{value:.1f}" if isinstance(value, float)
             else (str(value) if value is not None else "--")
         )
+        # Tight title → value, larger gap before next pair
         draw.text((x0 + int(18 * scale), y), label, font=font_label, fill=accent)
         draw.text(
-            (x0 + int(18 * scale), y + int(24 * scale)),
+            (x0 + int(18 * scale), y + int(16 * scale)),
             f"{val} {unit}".strip(),
             font=font_value,
             fill=(255, 255, 255, 255),
         )
-        y += int(58 * scale)
+        y += int(72 * scale)
 
     draw.text((x0 + int(18 * scale), y), "TIME", font=font_label, fill=(220, 220, 220, 255))
     draw.text(
-        (x0 + int(18 * scale), y + int(24 * scale)),
+        (x0 + int(18 * scale), y + int(16 * scale)),
         time_str,
         font=font_time,
         fill=(255, 255, 255, 255),
     )
-    y += int(60 * scale)
+    y += int(74 * scale)
 
     row("SPEED", speed_kmh, "km/h", (120, 200, 255, 255))
     row("HEART RATE", hr_val, "bpm", (255, 120, 120, 255))
@@ -1086,7 +1085,9 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
             })
             used.add(p["path"])
 
-    plan.sort(key=lambda e: (e["sort_key"], 0 if e["kind"] == "video_slice" else 1, e["path"]))
+    # On equal sort_key, put photo before the video_slice that starts at the same real time
+    # so mid-clip photos land between the two slices instead of after the remaining video.
+    plan.sort(key=lambda e: (e["sort_key"], 0 if e["kind"] == "photo" else 1, e["path"]))
 
     print("\nFinal render plan:")
     for i, e in enumerate(plan, 1):

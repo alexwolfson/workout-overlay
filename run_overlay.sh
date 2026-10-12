@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Alex Wolfson
 # SPDX-License-Identifier: MIT
 set -e
-
+echo $PWD
 if [ -f "$HOME/dashboard-env/bin/activate" ]; then
   # shellcheck disable=SC1091
   source "$HOME/dashboard-env/bin/activate"
@@ -33,5 +33,4 @@ if [ $# -lt 1 ]; then
   echo "  --no-auto-align"
   exit 1
 fi
-
 python workout_overlay.py "$@"
