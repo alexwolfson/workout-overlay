@@ -32,6 +32,33 @@ PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG", ".webp", ".WEBP"
 # ============================================================
 # FIT parsing
 # ============================================================
+def _rec_float(r, *names):
+    """First present numeric field among names, else nan."""
+    for name in names:
+        v = r.get(name)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return np.nan
+
+
+def detect_sport(records, forced=None):
+    """
+    Return 'dive' if FIT has depth samples, else 'outdoor'.
+    forced: 'dive' | 'freedive' | 'scuba' | 'outdoor' | 'auto' | None
+    """
+    if forced and forced not in ("auto", None, ""):
+        if forced in ("dive", "freedive", "scuba"):
+            return "dive"
+        return "outdoor"
+    n_depth = sum(1 for r in records if r.get("depth") is not None)
+    if n_depth >= 5:
+        return "dive"
+    return "outdoor"
+
+
 def parse_fit(fit_path):
     fit = FitFile(fit_path)
     records = []
@@ -55,10 +82,15 @@ def parse_fit(fit_path):
             lon = lon * (180.0 / 2**31)
             gps_points.append((lat, lon, r["timestamp"]))
 
+    sport = detect_sport(records)
+    n_depth = sum(1 for r in records if r.get("depth") is not None)
+    n_temp = sum(1 for r in records if r.get("temperature") is not None)
+
     print(f"FIT start     : {start_time}")
     print(f"FIT points    : {len(records)}")
     print(f"GPS points    : {len(gps_points)}")
     print(f"FIT duration  : {records[-1]['timestamp'] - start_time}")
+    print(f"Sport detect  : {sport}  (depth samples={n_depth}, temp samples={n_temp})")
     return records, start_time, gps_points
 
 
@@ -350,69 +382,101 @@ def build_time_map(segments):
 # ============================================================
 # Precompute / lookup helpers
 # ============================================================
+def _build_record_arrays(records, start_time):
+    """Arrays aligned to FIT records, including dive fields and running max depth."""
+    rec_times = np.array([(r["timestamp"] - start_time).total_seconds() for r in records])
+    rec_speed = np.array([_rec_float(r, "speed") for r in records])
+    rec_hr = np.array([_rec_float(r, "heart_rate") for r in records])
+    rec_elev = np.array([
+        _rec_float(r, "enhanced_altitude", "altitude") for r in records
+    ])
+    rec_dist = np.array([_rec_float(r, "distance") for r in records])
+    rec_depth = np.array([_rec_float(r, "depth") for r in records])
+    rec_temp = np.array([_rec_float(r, "temperature") for r in records])
+    rec_ndl = np.array([_rec_float(r, "ndl_time", "ndl") for r in records])
+    rec_tts = np.array([_rec_float(r, "time_to_surface") for r in records])
+    rec_ascent = np.array([_rec_float(r, "ascent_rate") for r in records])
+    rec_cns = np.array([_rec_float(r, "cns_load") for r in records])
+    rec_ts = [r["timestamp"] for r in records]
+
+    # Running max depth along the session (ignores nan gaps)
+    rec_max_depth = np.full(len(records), np.nan)
+    running = np.nan
+    for i, d in enumerate(rec_depth):
+        if not np.isnan(d):
+            running = d if np.isnan(running) else max(running, d)
+        rec_max_depth[i] = running
+
+    return {
+        "times": rec_times,
+        "speed": rec_speed,
+        "hr": rec_hr,
+        "elev": rec_elev,
+        "dist": rec_dist,
+        "depth": rec_depth,
+        "max_depth": rec_max_depth,
+        "temp": rec_temp,
+        "ndl": rec_ndl,
+        "tts": rec_tts,
+        "ascent": rec_ascent,
+        "cns": rec_cns,
+        "ts": rec_ts,
+    }
+
+
 def precompute_data(records, start_time, gps_points, video_to_real, duration, extra_offset, step=0.20):
     print("Precomputing dashboard data...")
     times = np.arange(0, duration + step, step)
     n = len(times)
-    speeds = np.full(n, np.nan)
-    hrs = np.full(n, np.nan)
-    elevs = np.full(n, np.nan)
-    dists = np.full(n, np.nan)
-    lats = np.full(n, np.nan)
-    lons = np.full(n, np.nan)
+    arrays = {k: np.full(n, np.nan) for k in (
+        "speed", "hr", "elev", "dist", "lat", "lon",
+        "depth", "max_depth", "temp", "ndl", "tts", "ascent", "cns",
+    )}
     clock = []
 
-    rec_times = np.array([(r["timestamp"] - start_time).total_seconds() for r in records])
-    rec_speed = np.array([r.get("speed") for r in records], dtype=float)
-    rec_hr = np.array([r.get("heart_rate") for r in records], dtype=float)
-    rec_elev = np.array([
-        r.get("enhanced_altitude") if r.get("enhanced_altitude") is not None else r.get("altitude")
-        for r in records
-    ], dtype=float)
-    rec_dist = np.array([r.get("distance") for r in records], dtype=float)
-    rec_ts = [r["timestamp"] for r in records]
+    rec = _build_record_arrays(records, start_time)
     gps_times = np.array([(p[2] - start_time).total_seconds() for p in gps_points]) if gps_points else np.array([])
     gps_lat = np.array([p[0] for p in gps_points]) if gps_points else np.array([])
     gps_lon = np.array([p[1] for p in gps_points]) if gps_points else np.array([])
 
     for i, t in enumerate(times):
         real_t = video_to_real(t) + extra_offset
-        idx = int(np.argmin(np.abs(rec_times - real_t)))
-        speeds[i] = rec_speed[idx]
-        hrs[i] = rec_hr[idx]
-        elevs[i] = rec_elev[idx]
-        dists[i] = rec_dist[idx]
-        clock.append(rec_ts[idx])
+        idx = int(np.argmin(np.abs(rec["times"] - real_t)))
+        for key in ("speed", "hr", "elev", "dist", "depth", "max_depth", "temp", "ndl", "tts", "ascent", "cns"):
+            arrays[key][i] = rec[key][idx]
+        clock.append(rec["ts"][idx])
         if len(gps_times) > 0:
             gidx = int(np.argmin(np.abs(gps_times - real_t)))
-            lats[i] = gps_lat[gidx]
-            lons[i] = gps_lon[gidx]
+            arrays["lat"][i] = gps_lat[gidx]
+            arrays["lon"][i] = gps_lon[gidx]
 
     print(f"Precomputed {n} points\n")
-    return times, speeds, hrs, elevs, dists, lats, lons, clock
+    return times, arrays, clock
 
 
 def lookup_at_real_t(records, start_time, gps_points, real_t):
-    rec_times = np.array([(r["timestamp"] - start_time).total_seconds() for r in records])
-    idx = int(np.argmin(np.abs(rec_times - real_t)))
-    r = records[idx]
-    speed = r.get("speed")
-    hr = r.get("heart_rate")
-    elev = r.get("enhanced_altitude") if r.get("enhanced_altitude") is not None else r.get("altitude")
-    dist = r.get("distance")
+    rec = _build_record_arrays(records, start_time)
+    idx = int(np.argmin(np.abs(rec["times"] - real_t)))
     lat = lon = np.nan
     if gps_points:
         gps_times = np.array([(p[2] - start_time).total_seconds() for p in gps_points])
         gidx = int(np.argmin(np.abs(gps_times - real_t)))
         lat, lon = gps_points[gidx][0], gps_points[gidx][1]
     return {
-        "speed": float(speed) if speed is not None else np.nan,
-        "hr": float(hr) if hr is not None else np.nan,
-        "elev": float(elev) if elev is not None else np.nan,
-        "dist": float(dist) if dist is not None else np.nan,
+        "speed": rec["speed"][idx],
+        "hr": rec["hr"][idx],
+        "elev": rec["elev"][idx],
+        "dist": rec["dist"][idx],
+        "depth": rec["depth"][idx],
+        "max_depth": rec["max_depth"][idx],
+        "temp": rec["temp"][idx],
+        "ndl": rec["ndl"][idx],
+        "tts": rec["tts"][idx],
+        "ascent": rec["ascent"][idx],
+        "cns": rec["cns"][idx],
         "lat": lat,
         "lon": lon,
-        "ts": r["timestamp"],
+        "ts": rec["ts"][idx],
     }
 
 
@@ -427,22 +491,85 @@ def latlon_to_pixel(lat, lon, min_lat, max_lat, min_lon, max_lon, map_w, map_h, 
     return int(x), int(y)
 
 
-def make_overlay_rgba_values(speed, hr, elev, dist, lat, lon, ts,
-                             gps_points, w, h, fonts, offset_hours):
+def _fmt_row_value(value, fmt="auto"):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    if fmt == "int":
+        return str(int(round(value)))
+    if fmt == "time_s":
+        # NDL / TTS as mm:ss when >= 60s, else seconds
+        s = int(round(value))
+        if s >= 60:
+            return f"{s // 60}:{s % 60:02d}"
+        return str(s)
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    return str(value)
+
+
+def make_overlay_rgba_values(data, gps_points, w, h, fonts, offset_hours, sport="outdoor"):
+    """
+    data: dict with keys speed, hr, elev, dist, depth, max_depth, temp,
+          ndl, tts, ascent, cns, lat, lon, ts
+    sport: 'outdoor' | 'dive'
+    """
     font_label, font_value, font_time = fonts
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    speed_kmh = speed * 3.6 if not np.isnan(speed) else None
-    dist_km = dist / 1000 if not np.isnan(dist) else None
-    hr_val = None if np.isnan(hr) else int(hr)
-    elev_val = None if np.isnan(elev) else elev
-    time_str = format_display_time(ts, offset_hours)
+    time_str = format_display_time(data["ts"], offset_hours)
+    lat = data.get("lat", np.nan)
+    lon = data.get("lon", np.nan)
+
+    # Build visible rows for this sport (skip missing values)
+    rows = []
+    if sport == "dive":
+        depth = data.get("depth", np.nan)
+        max_d = data.get("max_depth", np.nan)
+        hr = data.get("hr", np.nan)
+        temp = data.get("temp", np.nan)
+        ndl = data.get("ndl", np.nan)
+        tts = data.get("tts", np.nan)
+        ascent = data.get("ascent", np.nan)
+        cns = data.get("cns", np.nan)
+        if not (isinstance(depth, float) and np.isnan(depth)):
+            rows.append(("DEPTH", _fmt_row_value(depth), "m", (120, 200, 255, 255)))
+        if not (isinstance(max_d, float) and np.isnan(max_d)):
+            rows.append(("MAX DEPTH", _fmt_row_value(max_d), "m", (80, 180, 255, 255)))
+        if not (isinstance(hr, float) and np.isnan(hr)):
+            rows.append(("HEART RATE", _fmt_row_value(hr, "int"), "bpm", (255, 120, 120, 255)))
+        if not (isinstance(temp, float) and np.isnan(temp)):
+            rows.append(("TEMP", _fmt_row_value(temp), "°C", (140, 255, 180, 255)))
+        if not (isinstance(ndl, float) and np.isnan(ndl)):
+            rows.append(("NDL", _fmt_row_value(ndl, "time_s"), "min" if ndl >= 60 else "s", (255, 210, 120, 255)))
+        if not (isinstance(tts, float) and np.isnan(tts)):
+            rows.append(("TTS", _fmt_row_value(tts, "time_s"), "min" if tts >= 60 else "s", (255, 180, 100, 255)))
+        if not (isinstance(ascent, float) and np.isnan(ascent)):
+            # FIT often m/s; show m/min when small
+            if abs(ascent) < 2:
+                rows.append(("ASCENT", _fmt_row_value(ascent * 60), "m/min", (200, 160, 255, 255)))
+            else:
+                rows.append(("ASCENT", _fmt_row_value(ascent), "m/s", (200, 160, 255, 255)))
+        if not (isinstance(cns, float) and np.isnan(cns)):
+            rows.append(("CNS", _fmt_row_value(cns, "int"), "%", (255, 140, 180, 255)))
+    else:
+        speed = data.get("speed", np.nan)
+        hr = data.get("hr", np.nan)
+        elev = data.get("elev", np.nan)
+        dist = data.get("dist", np.nan)
+        speed_kmh = speed * 3.6 if not (isinstance(speed, float) and np.isnan(speed)) else None
+        dist_km = dist / 1000 if not (isinstance(dist, float) and np.isnan(dist)) else None
+        rows.append(("SPEED", _fmt_row_value(speed_kmh) if speed_kmh is not None else None, "km/h", (120, 200, 255, 255)))
+        rows.append(("HEART RATE", _fmt_row_value(hr, "int") if not (isinstance(hr, float) and np.isnan(hr)) else None, "bpm", (255, 120, 120, 255)))
+        rows.append(("ELEVATION", _fmt_row_value(elev) if not (isinstance(elev, float) and np.isnan(elev)) else None, "m", (140, 255, 180, 255)))
+        rows.append(("DISTANCE", _fmt_row_value(dist_km) if dist_km is not None else None, "km", (255, 210, 120, 255)))
 
     scale = max(1.0, w / 1920.0)
     margin = int(24 * scale)
-    box_w = int(420 * scale)
-    box_h = int(340 * scale)
+    box_w = int(320 * scale)
+    # Dynamic height: TIME block + each row + padding
+    box_h = int((12 + 74 + len(rows) * 72 + 20) * scale)
+    box_h = max(box_h, int(200 * scale))
     x0 = margin
     y0 = h - box_h - margin
 
@@ -453,15 +580,11 @@ def make_overlay_rgba_values(speed, hr, elev, dist, lat, lon, ts,
 
     def row(label, value, unit="", accent=(120, 200, 255, 255)):
         nonlocal y
-        val = (
-            f"{value:.1f}" if isinstance(value, float)
-            else (str(value) if value is not None else "--")
-        )
-        # Tight title → value, larger gap before next pair
+        val = value if value is not None else "--"
         draw.text((x0 + int(18 * scale), y), label, font=font_label, fill=accent)
         draw.text(
             (x0 + int(18 * scale), y + int(16 * scale)),
-            f"{val} {unit}".strip(),
+            f"{val} {unit}".strip() if value is not None else "--",
             font=font_value,
             fill=(255, 255, 255, 255),
         )
@@ -476,10 +599,8 @@ def make_overlay_rgba_values(speed, hr, elev, dist, lat, lon, ts,
     )
     y += int(74 * scale)
 
-    row("SPEED", speed_kmh, "km/h", (120, 200, 255, 255))
-    row("HEART RATE", hr_val, "bpm", (255, 120, 120, 255))
-    row("ELEVATION", elev_val, "m", (140, 255, 180, 255))
-    row("DISTANCE", dist_km, "km", (255, 210, 120, 255))
+    for label, value, unit, accent in rows:
+        row(label, value, unit, accent)
 
     if len(gps_points) >= 2:
         map_w = int(280 * scale)
@@ -510,11 +631,25 @@ def make_overlay_rgba_values(speed, hr, elev, dist, lat, lon, ts,
     return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
 
 
-def make_overlay_rgba(idx, speeds, hrs, elevs, dists, lats, lons, clock,
-                      gps_points, w, h, fonts, offset_hours):
+def make_overlay_rgba(idx, arrays, clock, gps_points, w, h, fonts, offset_hours, sport="outdoor"):
+    data = {
+        "speed": arrays["speed"][idx],
+        "hr": arrays["hr"][idx],
+        "elev": arrays["elev"][idx],
+        "dist": arrays["dist"][idx],
+        "depth": arrays["depth"][idx],
+        "max_depth": arrays["max_depth"][idx],
+        "temp": arrays["temp"][idx],
+        "ndl": arrays["ndl"][idx],
+        "tts": arrays["tts"][idx],
+        "ascent": arrays["ascent"][idx],
+        "cns": arrays["cns"][idx],
+        "lat": arrays["lat"][idx],
+        "lon": arrays["lon"][idx],
+        "ts": clock[idx],
+    }
     return make_overlay_rgba_values(
-        speeds[idx], hrs[idx], elevs[idx], dists[idx], lats[idx], lons[idx], clock[idx],
-        gps_points, w, h, fonts, offset_hours,
+        data, gps_points, w, h, fonts, offset_hours, sport=sport,
     )
 
 
@@ -577,10 +712,12 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
                    auto_align=True, offset_explicit=False,
                    records=None, start_time=None, gps_points=None,
                    factor=15.0, file_t_start=0.0, file_t_end=None,
-                   segments=None, fixed_offset=None):
+                   segments=None, fixed_offset=None, sport=None):
     """Render overlay for a full video or a [file_t_start, file_t_end) slice."""
     if records is None or start_time is None or gps_points is None:
         records, start_time, gps_points = parse_fit(fit_path)
+    sport = detect_sport(records, forced=sport)
+    print(f"Panel sport   : {sport}")
 
     if segments is None:
         segments = detect_speed_segments(video_path, factor=factor)
@@ -632,7 +769,7 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
         slice_note = f" | slice {t0:.2f}-{t1:.2f}s"
     print(f"Video: {duration:.1f}s | src {src_w}x{src_h} | out {out_w}x{out_h} | {fps:.3f} fps{slice_note}")
 
-    times, speeds, hrs, elevs, dists, lats, lons, clock = precompute_data(
+    times, arrays, clock = precompute_data(
         records, start_time, gps_points, video_to_real,
         duration, extra_offset, step=step,
     )
@@ -675,8 +812,8 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
         idx = max(0, min(idx, len(times) - 1))
         if idx not in cache:
             cache[idx] = make_overlay_rgba(
-                idx, speeds, hrs, elevs, dists, lats, lons, clock,
-                gps_points, out_w, out_h, fonts, offset_hours,
+                idx, arrays, clock,
+                gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
             )
         writer.write(alpha_blend(frame, cache[idx]))
         frames_written += 1
@@ -714,12 +851,13 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
 
 def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
                       out_w, out_h, fps, photo_seconds, time_mode, utc_offset,
-                      ref_video_for_tz=None):
+                      ref_video_for_tz=None, sport=None):
     # Resolve timezone first so EXIF local can be converted to UTC for FIT lookup
     offset_hours, offset_desc = resolve_display_offset_hours(
         ref_video_for_tz, time_mode, utc_offset
     )
     print(f"Display time   : {offset_desc}")
+    sport = detect_sport(records, forced=sport)
 
     real_t, photo_dt = photo_align_offset(photo_path, start_time, offset_hours=offset_hours)
     data = lookup_at_real_t(records, start_time, gps_points, real_t)
@@ -727,9 +865,7 @@ def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
     fonts = load_fonts(out_w)
     base = fit_image_to_canvas(photo_path, out_w, out_h)
     overlay = make_overlay_rgba_values(
-        data["speed"], data["hr"], data["elev"], data["dist"],
-        data["lat"], data["lon"], data["ts"],
-        gps_points, out_w, out_h, fonts, offset_hours,
+        data, gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
     )
     frame = alpha_blend(base, overlay)
 
@@ -1101,9 +1237,11 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
 
 def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
               time_mode="auto", utc_offset=None, auto_align=True, offset_explicit=False,
-              factor=15.0, photo_seconds=3.0, transition_seconds=0.0):
+              factor=15.0, photo_seconds=3.0, transition_seconds=0.0, sport=None):
     fit_path, videos, photos = discover_batch(folder)
     records, start_time, gps_points = parse_fit(fit_path)
+    sport = detect_sport(records, forced=sport)
+    print(f"Panel sport   : {sport}")
 
     plan, _offset_hours = build_batch_plan(
         videos, photos, fit_path, records, start_time, gps_points,
@@ -1156,12 +1294,13 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
                     factor=factor,
                     file_t_start=e["t0"], file_t_end=e["t1"],
                     segments=e["segments"], fixed_offset=e["align"],
+                    sport=sport,
                 )
             else:
                 create_photo_clip(
                     e["path"], out_clip, records, start_time, gps_points,
                     out_w, out_h, fps, photo_seconds, time_mode, utc_offset,
-                    ref_video_for_tz=ref_video,
+                    ref_video_for_tz=ref_video, sport=sport,
                 )
             clip_outputs.append(out_clip)
 
@@ -1204,10 +1343,14 @@ def main():
                    help="Seconds to show each photo in batch mode (default: 3)")
     p.add_argument("--transition-seconds", type=float, default=0.0,
                    help="Fade through black between clips (extra seconds, 0=hard cut, e.g. 2)")
+    p.add_argument("--sport", choices=("auto", "outdoor", "dive", "freedive", "scuba"),
+                   default="auto",
+                   help="Panel field set: auto detects dive from FIT depth samples")
     args = p.parse_args()
 
     offset_explicit = args.offset is not None
     extra_offset = 0.0 if args.offset is None else args.offset
+    sport = None if args.sport == "auto" else args.sport
 
     if args.batch:
         output = args.output or "workout_batch.mp4"
@@ -1217,7 +1360,7 @@ def main():
             time_mode=args.time, utc_offset=args.utc_offset,
             auto_align=args.auto_align, offset_explicit=offset_explicit,
             factor=args.factor, photo_seconds=args.photo_seconds,
-            transition_seconds=args.transition_seconds,
+            transition_seconds=args.transition_seconds, sport=sport,
         )
         return
 
@@ -1230,7 +1373,7 @@ def main():
         extra_offset=extra_offset, step=args.step, preview=args.preview,
         time_mode=args.time, utc_offset=args.utc_offset,
         auto_align=args.auto_align, offset_explicit=offset_explicit,
-        factor=args.factor,
+        factor=args.factor, sport=sport,
     )
 
 

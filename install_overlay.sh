@@ -17,6 +17,8 @@ pip install --upgrade pip
 if [ -f requirements.txt ]; then
   pip install -r requirements.txt
 else
-  pip install fitparse opencv-python numpy pillow librosa soundfile
+  pip install fitparse opencv-python numpy pillow librosa soundfile customtkinter
 fi
 echo "Done. Activate with: source ~/dashboard-env/bin/activate"
+echo "CLI:  ./run_overlay.sh --batch ./folder --preview"
+echo "GUI:  ./run_debug_gui.sh"

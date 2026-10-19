@@ -1,9 +1,9 @@
 # Workout Overlay
 
-**Version 1.0** — DJI Osmo + Zepp/Amazfit FIT on Linux
+**Version 1.1** — DJI Osmo + Zepp/Amazfit FIT on Linux
 
 Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
-Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions.
+Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions, outdoor and **dive** panels.
 
 <img width="1931" height="1194" alt="Screenshot_2026-10-09_16-58-32" src="https://github.com/user-attachments/assets/2f17610c-0349-44d3-9c2a-2d8c9ad54cb3" />
 
@@ -11,7 +11,8 @@ Built for real outings: one workout FIT, many Osmo (or phone) clips, photos take
 ## Features
 
 - **Single clip** or **batch folder** (one `.fit` + many videos/photos)
-- Telemetry panel: time, speed, heart rate, elevation, distance + GPS minimap
+- **Outdoor panel**: time, speed, heart rate, elevation, distance + GPS minimap
+- **Dive panel** (auto when FIT has depth samples): time, depth, max depth, heart rate, temperature; plus NDL, TTS, ascent rate, CNS when present in the FIT
 - **Auto-align** video to FIT via MP4 `creation_time` (default on)
 - **Hyperlapse**: silent sections use `--factor` (default 15×); audio sections stay 1×
 - **Photos** in batch: EXIF time → FIT (local EXIF converted with display TZ offset)
@@ -19,6 +20,7 @@ Built for real outings: one workout FIT, many Osmo (or phone) clips, photos take
 - **Transitions**: `--transition-seconds N` fades out to black then in (extra time; content not shortened)
 - **Preview** mode: 1080p for faster test renders
 - Time display: `--time auto|local|utc` and optional `--utc-offset`
+- **`--sport`**: `auto` | `outdoor` | `dive` | `freedive` | `scuba`
 
 ## Requirements
 
@@ -74,29 +76,34 @@ my_walk/
   -o walk_batch.mp4
 ```
 
+### Dive / underwater
+
+FIT files with depth samples switch to the dive panel automatically. Underwater is usually pure 1× video:
+
+```bash
+./run_overlay.sh --batch ./my_dive --factor 1 --preview -o dive_out.mp4
+./run_overlay.sh dive.mp4 dive.fit --sport dive --factor 1 -o dive_out.mp4
+```
+
 | Option | Meaning | Default |
 |--------|---------|---------|
 | `--batch DIR` | Process folder | — |
 | `--preview` | Render at 1080p | off (full resolution) |
 | `--photo-seconds N` | How long each still is shown | `3` |
-| `--transition-seconds N` | Fade through black between items (extra time) | `0` (hard cut) |
-| `--factor N` | Hyperlapse speed for **silent** sections | `15` |
-| `--time auto\|local\|utc` | Clock display mode | `auto` |
-| `--utc-offset H` | Force UTC offset hours (e.g. `-4`) | from auto/DJI |
-| `--no-auto-align` | Disable video start ↔ FIT start align | auto on |
+| `--transition-seconds N` | Fade through black between clips (extra time) | `0` (hard cut) |
+| `--factor N` | Speed assumed for **silent** sections | `15` |
+| `--sport MODE` | Panel fields: `auto`, `outdoor`, `dive`, `freedive`, `scuba` | `auto` |
+| `--time auto\|local\|utc` | How TIME is displayed | `auto` |
+| `--utc-offset HOURS` | Force display timezone offset | from video when possible |
+| `--no-auto-align` | Do not use MP4 creation_time vs FIT start | auto-align on |
 | `-o FILE` | Output path | `workout_overlay.mp4` / `workout_batch.mp4` |
 
-Direct Python (with venv active):
+`freedive` and `scuba` both use the dive panel; extra scuba metrics (NDL, TTS, …) appear only if the FIT contains them.
 
-```bash
-source ~/dashboard-env/bin/activate
-python workout_overlay.py --batch ./my_walk --preview --transition-seconds 2 -o out.mp4
-```
+## Alignment model
 
-## How alignment works
-
-| Media | Method |
-|-------|--------|
+| Media | How it is placed on the FIT timeline |
+|-------|--------------------------------------|
 | **Video** | MP4 `creation_time` (UTC) vs FIT start → offset (auto). Hyperlapse map from audio. |
 | **Photo** | EXIF capture time treated as **local**; converted to UTC with the same offset as `--time auto` / `--utc-offset`, then placed on the FIT timeline. |
 | **Mid-clip photo** | If photo time falls inside a video’s FIT window, that video is split and the still is inserted at that moment. |
@@ -106,11 +113,44 @@ Original DJI files keep reliable timestamps. Edited/merged exports often lose `c
 ## Hyperlapse note
 
 Detection assumes **silent ≈ sped-up** and **audio ≈ 1×**.  
-Quiet 1× audio (e.g. mic noise cancellation) can be mistaken for hyperlapse. For pure 1× walks:
+Quiet 1× audio (e.g. mic noise cancellation) can be mistaken for hyperlapse. For pure 1× walks or underwater:
 
 ```bash
 --factor 1
 ```
+
+For intentional hyperlapse, leave the default (`15`) and prefer **noise cancellation off** on the camera so silence tracking stays honest.
+
+## Dive fields
+
+When the panel is in dive mode, rows are drawn only if the value exists in the FIT:
+
+| Label | FIT source |
+|-------|------------|
+| DEPTH | `depth` |
+| MAX DEPTH | running max of `depth` |
+| HEART RATE | `heart_rate` |
+| TEMP | `temperature` |
+| NDL | `ndl_time` / `ndl` (when present) |
+| TTS | `time_to_surface` (when present) |
+| ASCENT | `ascent_rate` (when present) |
+| CNS | `cns_load` (when present) |
+
+Amazfit freedive exports typically include depth, temperature, and heart rate. Scuba-specific fields depend on the watch model and session.
+
+## Debug GUI
+
+Optional CustomTkinter tool for alignment / hyperlapse debugging:
+
+```bash
+pip install customtkinter   # once, in ~/dashboard-env
+./run_debug_gui.sh
+./run_debug_gui.sh /path/to/batch_folder
+```
+
+- Pick a batch folder (one `.fit` + videos/photos)
+- Preview clip with scrub; see **file time**, **detected factor (1×/15×)**, **mapped FIT time**, sample telemetry
+- Segment list, auto-align note, render plan, copy debug snapshot
 
 ## Project layout
 
@@ -124,7 +164,7 @@ README.md
 .gitignore
 ```
 
-## Version 1.0 scope
+## Scope
 
 **Supported today**
 
@@ -132,26 +172,25 @@ README.md
 - DJI Osmo-style MP4/JPG + phone stills
 - Zepp / Amazfit (and typical FIT) activity files
 - Single + batch pipelines, auto-align, mid-clip photos, fade transitions
+- Outdoor and dive telemetry panels (`--sport` / auto-detect from depth)
 
-**Not in 1.0**
+**Not yet**
 
 - Official Windows/macOS support (may work; not tested)
-- GoPro / other camera profiles
-- Garmin / Apple Watch first-class loaders
+- Full camera-specific profiles beyond current DJI/GoPro heuristics
 - GUI
-- Dive-specific UI (depth, water temp)
 - Map tiles under the minimap
+- Perimeter / Mimo-style dive layout (depth graph)
 
 ## Roadmap
 
-Ordered for stability first (CLI/API before GUI):
+Ordered for stability first (CLI before GUI):
 
-1. **Device profiles** — thin adapters for video start time and activity load (DJI first; GoPro 11 next candidate).
-2. **Workout / sport defaults** — walk, run, bike, freedive, scuba (fields and sensible `--factor` defaults; dive metrics later).
-3. **Cross-platform GUI** — simple wrapper (folder, options, log) on Linux / Windows / macOS once CLI flags are stable.
-4. **Extras** — FIT GPS → timezone for travel processing, cadence/temperature when present, optional map tiles.
-
-Contributions that follow this direction are welcome once the repo is public.
+1. **Device profiles** — thin adapters for video start time and activity load.
+2. **Sport defaults** — walk, run, bike, freedive, scuba field lists and sensible `--factor` defaults.
+3. **Optional segment map** — side file or tiny mark script for mixed hyperlapse clips.
+4. **Cross-platform GUI** — simple wrapper once CLI flags are stable.
+5. **Extras** — map tiles, perimeter dive layout, FIT GPS → timezone for travel.
 
 ## Contributing
 
