@@ -44,15 +44,84 @@ def _rec_float(r, *names):
     return np.nan
 
 
-def detect_sport(records, forced=None):
+# FIT sport enum (common values). fitparse may return int or string.
+SPORT_ID_MAP = {
+    0: "generic", 1: "running", 2: "cycling", 5: "swimming",
+    11: "walking", 15: "rowing", 17: "hiking", 21: "e_biking",
+    53: "diving",
+}
+
+# Session sport / sub_sport strings (and id names) that use the dive panel
+DIVE_SPORT_TOKENS = {
+    "diving", "dive", "scuba", "scuba_diving", "apnea", "apnea_diving",
+    "freedive", "free_dive", "freediving", "spearfishing",
+}
+
+
+def read_session_sport(fit_path):
     """
-    Return 'dive' if FIT has depth samples, else 'outdoor'.
-    forced: 'dive' | 'freedive' | 'scuba' | 'outdoor' | 'auto' | None
+    Read sport / sub_sport from the first session message.
+    Returns dict: sport, sub_sport, sport_id, sport_name (best-effort strings/ids).
+    """
+    fit = FitFile(fit_path)
+    out = {"sport": None, "sub_sport": None, "sport_id": None, "sport_name": None}
+    for session_msg in fit.get_messages("session"):
+        data = {f.name: f.value for f in session_msg}
+        sport = data.get("sport")
+        sub = data.get("sub_sport")
+        out["sport"] = sport
+        out["sub_sport"] = sub
+        if isinstance(sport, int):
+            out["sport_id"] = sport
+            out["sport_name"] = SPORT_ID_MAP.get(sport, f"id_{sport}")
+        elif sport is not None:
+            out["sport_name"] = str(sport).strip().lower()
+            # reverse lookup if string matches map values
+            for sid, name in SPORT_ID_MAP.items():
+                if name == out["sport_name"]:
+                    out["sport_id"] = sid
+                    break
+        break
+    return out
+
+
+def detect_sport(records, forced=None, fit_path=None, session=None):
+    """
+    Return panel mode: 'dive' or 'outdoor'.
+
+    Priority:
+      1. forced flag (dive|freedive|scuba|outdoor)
+      2. session sport / sub_sport from FIT (if fit_path or session given)
+      3. depth samples in records (>= 5)
+      4. outdoor
     """
     if forced and forced not in ("auto", None, ""):
         if forced in ("dive", "freedive", "scuba"):
             return "dive"
         return "outdoor"
+
+    if session is None and fit_path:
+        try:
+            session = read_session_sport(fit_path)
+        except Exception:
+            session = None
+
+    if session:
+        tokens = []
+        for key in ("sport_name", "sport", "sub_sport"):
+            v = session.get(key)
+            if v is None:
+                continue
+            if isinstance(v, int):
+                tokens.append(SPORT_ID_MAP.get(v, str(v)).lower())
+                if v == 53:
+                    return "dive"
+            else:
+                tokens.append(str(v).strip().lower().replace(" ", "_"))
+        for t in tokens:
+            if t in DIVE_SPORT_TOKENS or "dive" in t or "scuba" in t or "apnea" in t:
+                return "dive"
+
     n_depth = sum(1 for r in records if r.get("depth") is not None)
     if n_depth >= 5:
         return "dive"
@@ -82,7 +151,13 @@ def parse_fit(fit_path):
             lon = lon * (180.0 / 2**31)
             gps_points.append((lat, lon, r["timestamp"]))
 
-    sport = detect_sport(records)
+    session = None
+    try:
+        session = read_session_sport(fit_path)
+    except Exception:
+        session = None
+
+    sport = detect_sport(records, fit_path=fit_path, session=session)
     n_depth = sum(1 for r in records if r.get("depth") is not None)
     n_temp = sum(1 for r in records if r.get("temperature") is not None)
 
@@ -90,7 +165,31 @@ def parse_fit(fit_path):
     print(f"FIT points    : {len(records)}")
     print(f"GPS points    : {len(gps_points)}")
     print(f"FIT duration  : {records[-1]['timestamp'] - start_time}")
+    if session:
+        print(
+            f"Session sport : sport={session.get('sport')!r}  "
+            f"sub_sport={session.get('sub_sport')!r}  "
+            f"name={session.get('sport_name')!r}"
+        )
     print(f"Sport detect  : {sport}  (depth samples={n_depth}, temp samples={n_temp})")
+    if sport == "dive" or n_depth >= 5:
+        immersions = detect_dive_immersions(records, start_time)
+        if immersions:
+            print(
+                f"Dive immersions: {len(immersions)}  "
+                f"(start>={DIVE_START_DEPTH_M}m end<={DIVE_END_DEPTH_M}m "
+                f"min>={DIVE_MIN_DURATION_S}s start_hold>={DIVE_START_HOLD_S}s "
+                f"end_hold>={DIVE_END_HOLD_S}s merge_gap<={DIVE_MERGE_SURFACE_GAP_S}s)"
+            )
+
+
+            for im in immersions:
+                print(
+                    f"  #{im['num']}  {im['start_s']:.1f}→{im['end_s']:.1f}s  "
+                    f"({im['end_s'] - im['start_s']:.0f}s)  max={im['max_depth']:.1f}m"
+                )
+        else:
+            print("Dive immersions: none (try lower depth threshold if Zepp shows dives)")
     return records, start_time, gps_points
 
 
@@ -380,10 +479,162 @@ def build_time_map(segments):
 
 
 # ============================================================
+# Dive immersion detection (depth timeline — Amazfit multi-dive)
+# ============================================================
+# Amazfit auto start ~1.2 m / end ~0.9 m.
+# One continuous scuba dive must not be split by brief shallow noise.
+DIVE_START_DEPTH_M = 1.2
+DIVE_END_DEPTH_M = 0.9
+DIVE_MIN_DURATION_S = 30.0          # ignore short dips
+DIVE_START_HOLD_S = 5.0             # time deeper than start threshold to begin
+DIVE_END_HOLD_S = 60.0              # must stay shallow this long to end a dive
+DIVE_MERGE_SURFACE_GAP_S = 600.0    # surface < 10 min → still same dive
+
+
+def detect_dive_immersions(
+    records,
+    start_time,
+    start_depth_m=DIVE_START_DEPTH_M,
+    end_depth_m=DIVE_END_DEPTH_M,
+    min_duration_s=DIVE_MIN_DURATION_S,
+    start_hold_s=DIVE_START_HOLD_S,
+    end_hold_s=DIVE_END_HOLD_S,
+    merge_surface_gap_s=DIVE_MERGE_SURFACE_GAP_S,
+):
+    """
+    Split a multi-dive session into immersions from the depth series.
+    Returns list of dicts: num (1-based), start_s, end_s, max_depth
+    (times are seconds from FIT start_time).
+
+    Not per-video: always the full FIT timeline.
+    Robustness for one long scuba dive:
+      - missing depth forward-filled (not treated as 0 m)
+      - start after start_hold_s deep
+      - end only after end_hold_s continuous shallow (default 60 s)
+      - merge immersions with surface gap <= merge_surface_gap_s (default 10 min)
+    """
+    times = []
+    depths_raw = []
+    for r in records:
+        t = (r["timestamp"] - start_time).total_seconds()
+        d = r.get("depth")
+        times.append(t)
+        try:
+            depths_raw.append(float(d) if d is not None else None)
+        except (TypeError, ValueError):
+            depths_raw.append(None)
+
+    if not times:
+        return []
+
+    # Forward-fill missing depth so gaps do not look like the surface
+    depths = []
+    last = 0.0
+    for d in depths_raw:
+        if d is not None and not (isinstance(d, float) and np.isnan(d)):
+            last = d
+        depths.append(last)
+
+    immersions = []
+    in_dive = False
+    seg_start = 0.0
+    max_d = 0.0
+    pending_start_t = None
+    pending_end_t = None
+
+    for t, dep in zip(times, depths):
+        if not in_dive:
+            if dep >= start_depth_m:
+                if pending_start_t is None:
+                    pending_start_t = t
+                elif t - pending_start_t >= start_hold_s:
+                    in_dive = True
+                    seg_start = pending_start_t
+                    max_d = dep
+                    pending_start_t = None
+                    pending_end_t = None
+            else:
+                pending_start_t = None
+        else:
+            if dep > max_d:
+                max_d = dep
+            if dep <= end_depth_m:
+                if pending_end_t is None:
+                    pending_end_t = t
+                elif t - pending_end_t >= end_hold_s:
+                    end_t = pending_end_t
+                    dur = end_t - seg_start
+                    if dur >= min_duration_s:
+                        immersions.append({
+                            "num": len(immersions) + 1,
+                            "start_s": seg_start,
+                            "end_s": end_t,
+                            "max_depth": max_d,
+                        })
+                    in_dive = False
+                    pending_end_t = None
+                    pending_start_t = None
+            else:
+                pending_end_t = None  # went deep again — cancel surface
+
+    if in_dive and times:
+        end_t = times[-1]
+        if end_t - seg_start >= min_duration_s:
+            immersions.append({
+                "num": len(immersions) + 1,
+                "start_s": seg_start,
+                "end_s": end_t,
+                "max_depth": max_d,
+            })
+
+    # Merge immersions separated by a short surface interval
+    if len(immersions) >= 2 and merge_surface_gap_s > 0:
+        merged = [dict(immersions[0])]
+        for im in immersions[1:]:
+            prev = merged[-1]
+            gap = im["start_s"] - prev["end_s"]
+            if gap <= merge_surface_gap_s:
+                prev["end_s"] = im["end_s"]
+                prev["max_depth"] = max(prev["max_depth"], im["max_depth"])
+            else:
+                merged.append(dict(im))
+        for i, im in enumerate(merged, 1):
+            im["num"] = i
+        immersions = merged
+
+    return immersions
+
+
+def _dive_state_at(immersions, real_t):
+    """
+    Return (dive_num, dive_time_s, dive_max_depth) at real_t.
+    While underwater: live dive time. On surface: hide dive time (nan),
+    keep last dive number for context.
+    """
+    if not immersions:
+        return np.nan, np.nan, np.nan
+    for im in immersions:
+        if im["start_s"] <= real_t <= im["end_s"]:
+            return float(im["num"]), real_t - im["start_s"], im["max_depth"]
+    last = None
+    for im in immersions:
+        if im["end_s"] < real_t:
+            last = im
+        elif im["start_s"] > real_t:
+            break
+    if last is not None:
+        return float(last["num"]), np.nan, last["max_depth"]
+    return np.nan, np.nan, np.nan
+
+
+# ============================================================
 # Precompute / lookup helpers
 # ============================================================
-def _build_record_arrays(records, start_time):
-    """Arrays aligned to FIT records, including dive fields and running max depth."""
+def _build_record_arrays(records, start_time, immersions=None):
+    """Arrays aligned to FIT records, including dive fields and per-dive max depth."""
+    if immersions is None:
+        immersions = detect_dive_immersions(records, start_time)
+
     rec_times = np.array([(r["timestamp"] - start_time).total_seconds() for r in records])
     rec_speed = np.array([_rec_float(r, "speed") for r in records])
     rec_hr = np.array([_rec_float(r, "heart_rate") for r in records])
@@ -399,13 +650,25 @@ def _build_record_arrays(records, start_time):
     rec_cns = np.array([_rec_float(r, "cns_load") for r in records])
     rec_ts = [r["timestamp"] for r in records]
 
-    # Running max depth along the session (ignores nan gaps)
-    rec_max_depth = np.full(len(records), np.nan)
-    running = np.nan
+    n = len(records)
+    rec_max_depth = np.full(n, np.nan)
+    rec_dive_num = np.full(n, np.nan)
+    rec_dive_time = np.full(n, np.nan)
+
+    # Session running max (fallback)
+    session_running = np.nan
     for i, d in enumerate(rec_depth):
         if not np.isnan(d):
-            running = d if np.isnan(running) else max(running, d)
-        rec_max_depth[i] = running
+            session_running = d if np.isnan(session_running) else max(session_running, d)
+        real_t = rec_times[i]
+        dnum, dtime, dmax = _dive_state_at(immersions, real_t)
+        rec_dive_num[i] = dnum
+        rec_dive_time[i] = dtime
+        # Prefer current/last dive max; else session running max
+        if dmax is not None and not (isinstance(dmax, float) and np.isnan(dmax)):
+            rec_max_depth[i] = dmax
+        else:
+            rec_max_depth[i] = session_running
 
     return {
         "times": rec_times,
@@ -420,7 +683,10 @@ def _build_record_arrays(records, start_time):
         "tts": rec_tts,
         "ascent": rec_ascent,
         "cns": rec_cns,
+        "dive_num": rec_dive_num,
+        "dive_time": rec_dive_time,
         "ts": rec_ts,
+        "immersions": immersions,
     }
 
 
@@ -431,10 +697,19 @@ def precompute_data(records, start_time, gps_points, video_to_real, duration, ex
     arrays = {k: np.full(n, np.nan) for k in (
         "speed", "hr", "elev", "dist", "lat", "lon",
         "depth", "max_depth", "temp", "ndl", "tts", "ascent", "cns",
+        "dive_num", "dive_time",
     )}
     clock = []
 
     rec = _build_record_arrays(records, start_time)
+    immersions = rec.get("immersions") or []
+    if immersions:
+        print(f"Dive immersions detected: {len(immersions)}")
+        for im in immersions:
+            print(
+                f"  #{im['num']}  {im['start_s']:.1f}→{im['end_s']:.1f}s  "
+                f"({im['end_s'] - im['start_s']:.0f}s)  max={im['max_depth']:.1f}m"
+            )
     gps_times = np.array([(p[2] - start_time).total_seconds() for p in gps_points]) if gps_points else np.array([])
     gps_lat = np.array([p[0] for p in gps_points]) if gps_points else np.array([])
     gps_lon = np.array([p[1] for p in gps_points]) if gps_points else np.array([])
@@ -442,7 +717,10 @@ def precompute_data(records, start_time, gps_points, video_to_real, duration, ex
     for i, t in enumerate(times):
         real_t = video_to_real(t) + extra_offset
         idx = int(np.argmin(np.abs(rec["times"] - real_t)))
-        for key in ("speed", "hr", "elev", "dist", "depth", "max_depth", "temp", "ndl", "tts", "ascent", "cns"):
+        for key in (
+            "speed", "hr", "elev", "dist", "depth", "max_depth", "temp",
+            "ndl", "tts", "ascent", "cns", "dive_num", "dive_time",
+        ):
             arrays[key][i] = rec[key][idx]
         clock.append(rec["ts"][idx])
         if len(gps_times) > 0:
@@ -474,6 +752,8 @@ def lookup_at_real_t(records, start_time, gps_points, real_t):
         "tts": rec["tts"][idx],
         "ascent": rec["ascent"][idx],
         "cns": rec["cns"][idx],
+        "dive_num": rec["dive_num"][idx],
+        "dive_time": rec["dive_time"][idx],
         "lat": lat,
         "lon": lon,
         "ts": rec["ts"][idx],
@@ -532,6 +812,15 @@ def make_overlay_rgba_values(data, gps_points, w, h, fonts, offset_hours, sport=
         tts = data.get("tts", np.nan)
         ascent = data.get("ascent", np.nan)
         cns = data.get("cns", np.nan)
+        dive_num = data.get("dive_num", np.nan)
+        dive_time = data.get("dive_time", np.nan)
+        if not (isinstance(dive_num, float) and np.isnan(dive_num)):
+            rows.append(("DIVE", _fmt_row_value(dive_num, "int"), "", (180, 220, 255, 255)))
+        if not (isinstance(dive_time, float) and np.isnan(dive_time)):
+            rows.append(
+                ("DIVE TIME", _fmt_row_value(dive_time, "time_s"),
+                 "min" if dive_time >= 60 else "s", (200, 230, 255, 255))
+            )
         if not (isinstance(depth, float) and np.isnan(depth)):
             rows.append(("DEPTH", _fmt_row_value(depth), "m", (120, 200, 255, 255)))
         if not (isinstance(max_d, float) and np.isnan(max_d)):
@@ -644,6 +933,8 @@ def make_overlay_rgba(idx, arrays, clock, gps_points, w, h, fonts, offset_hours,
         "tts": arrays["tts"][idx],
         "ascent": arrays["ascent"][idx],
         "cns": arrays["cns"][idx],
+        "dive_num": arrays["dive_num"][idx] if "dive_num" in arrays else np.nan,
+        "dive_time": arrays["dive_time"][idx] if "dive_time" in arrays else np.nan,
         "lat": arrays["lat"][idx],
         "lon": arrays["lon"][idx],
         "ts": clock[idx],
@@ -716,7 +1007,7 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
     """Render overlay for a full video or a [file_t_start, file_t_end) slice."""
     if records is None or start_time is None or gps_points is None:
         records, start_time, gps_points = parse_fit(fit_path)
-    sport = detect_sport(records, forced=sport)
+    sport = detect_sport(records, forced=sport, fit_path=fit_path)
     print(f"Panel sport   : {sport}")
 
     if segments is None:
@@ -857,7 +1148,7 @@ def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
         ref_video_for_tz, time_mode, utc_offset
     )
     print(f"Display time   : {offset_desc}")
-    sport = detect_sport(records, forced=sport)
+    sport = detect_sport(records, forced=sport, fit_path=None)
 
     real_t, photo_dt = photo_align_offset(photo_path, start_time, offset_hours=offset_hours)
     data = lookup_at_real_t(records, start_time, gps_points, real_t)
@@ -1240,7 +1531,7 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
               factor=15.0, photo_seconds=3.0, transition_seconds=0.0, sport=None):
     fit_path, videos, photos = discover_batch(folder)
     records, start_time, gps_points = parse_fit(fit_path)
-    sport = detect_sport(records, forced=sport)
+    sport = detect_sport(records, forced=sport, fit_path=fit_path)
     print(f"Panel sport   : {sport}")
 
     plan, _offset_hours = build_batch_plan(

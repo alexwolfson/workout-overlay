@@ -12,6 +12,7 @@ with file time, detected factor (1x/15x), mapped FIT time, and sample values.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -107,6 +108,7 @@ class DebugApp(ctk.CTk):
         self.playing = False
         self.play_job = None
         self._photo_image = None  # keep ref
+        self._ffplay_proc: subprocess.Popen | None = None
 
         self._build_ui()
         if initial_folder and os.path.isdir(initial_folder):
@@ -186,11 +188,15 @@ class DebugApp(ctk.CTk):
             "factor": ctk.StringVar(value="Factor: --"),
             "real_t": ctk.StringVar(value="Real (FIT) t: --"),
             "fit_clock": ctk.StringVar(value="FIT clock: --"),
+            "movie_t": ctk.StringVar(value="Movie time: --"),
             "align": ctk.StringVar(value="Align: --"),
             "sample": ctk.StringVar(value="Sample: --"),
             "sport": ctk.StringVar(value="Sport: --"),
         }
-        for key in ("file_t", "factor", "real_t", "fit_clock", "align", "sample", "sport"):
+        for key in (
+            "file_t", "factor", "real_t", "fit_clock", "movie_t",
+            "align", "sample", "sport",
+        ):
             ctk.CTkLabel(info, textvariable=self.info_vars[key], anchor="w").pack(
                 fill="x", padx=6, pady=1
             )
@@ -252,13 +258,27 @@ class DebugApp(ctk.CTk):
         self.start_time = start_time
         self.gps_points = gps_points
         forced = None if self.sport_var.get() == "auto" else self.sport_var.get()
-        self.sport = wo.detect_sport(records, forced=forced)
+        session = None
+        try:
+            session = wo.read_session_sport(fit_path)
+        except Exception:
+            session = None
+        self.sport = wo.detect_sport(
+            records, forced=forced, fit_path=fit_path, session=session
+        )
+        self._session = session
 
         self.folder_label.configure(text=f"{path}   |  {Path(fit_path).name}")
-        self.info_vars["sport"].set(f"Sport: {self.sport}")
+        sport_detail = self.sport
+        if session and (session.get("sport") is not None or session.get("sport_name")):
+            sport_detail = (
+                f"{self.sport}  (session sport={session.get('sport')!r} "
+                f"sub={session.get('sub_sport')!r} name={session.get('sport_name')!r})"
+            )
+        self.info_vars["sport"].set(f"Sport: {sport_detail}")
         self.log(f"Loaded folder: {path}")
         self.log(f"FIT: {Path(fit_path).name}  start={start_time}  points={len(records)}")
-        self.log(f"Videos={len(videos)}  Photos={len(photos)}  sport={self.sport}")
+        self.log(f"Videos={len(videos)}  Photos={len(photos)}  sport={sport_detail}")
 
         for w in self._media_buttons:
             w.destroy()
@@ -298,7 +318,10 @@ class DebugApp(ctk.CTk):
         if self.records is None:
             return
         forced = None if self.sport_var.get() == "auto" else self.sport_var.get()
-        self.sport = wo.detect_sport(self.records, forced=forced)
+        session = getattr(self, "_session", None)
+        self.sport = wo.detect_sport(
+            self.records, forced=forced, fit_path=self.fit_path, session=session
+        )
         self.info_vars["sport"].set(f"Sport: {self.sport}")
         self.update_readout(self._current_file_t())
 
@@ -426,6 +449,49 @@ class DebugApp(ctk.CTk):
         else:
             self.update_readout(0.0)
 
+    def _stop_ffplay(self):
+        proc = self._ffplay_proc
+        self._ffplay_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def _start_ffplay(self, start_s: float):
+        """Play audio (no video window) from start_s via ffplay."""
+        self._stop_ffplay()
+        if not self.current_path or self.kind != "video":
+            return
+        start_s = max(0.0, float(start_s))
+        cmd = [
+            "ffplay",
+            "-nodisp",
+            "-autoexit",
+            "-loglevel", "quiet",
+            "-ss", f"{start_s:.3f}",
+            "-i", self.current_path,
+        ]
+        try:
+            self._ffplay_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log(f"ffplay audio from {start_s:.2f}s")
+        except FileNotFoundError:
+            self.log("ffplay not found (install ffmpeg); video-only preview")
+            self._ffplay_proc = None
+        except Exception as e:
+            self.log(f"ffplay error: {e}")
+            self._ffplay_proc = None
+
     def toggle_play(self):
         if self.kind != "video" or self.cap is None:
             return
@@ -434,8 +500,10 @@ class DebugApp(ctk.CTk):
             if self.play_job:
                 self.after_cancel(self.play_job)
                 self.play_job = None
+            self._stop_ffplay()
         else:
             self.playing = True
+            self._start_ffplay(self._current_file_t())
             self._play_tick()
 
     def stop_play(self):
@@ -443,6 +511,7 @@ class DebugApp(ctk.CTk):
         if self.play_job:
             self.after_cancel(self.play_job)
             self.play_job = None
+        self._stop_ffplay()
 
     def _play_tick(self):
         if not self.playing or self.cap is None:
@@ -450,7 +519,11 @@ class DebugApp(ctk.CTk):
         t = self._current_file_t() + (1.0 / max(self.fps, 1.0))
         if t >= self.duration:
             self.playing = False
+            self._stop_ffplay()
             return
+        # If ffplay exited early, keep video advancing without audio
+        if self._ffplay_proc is not None and self._ffplay_proc.poll() is not None:
+            self._ffplay_proc = None
         self.scrub.set(t)
         self.show_frame_at(t)
         delay = max(1, int(1000 / max(self.fps, 1.0)))
@@ -459,6 +532,11 @@ class DebugApp(ctk.CTk):
     # ---------------------------------------------------------- readout
     def update_readout(self, file_t: float):
         self.info_vars["file_t"].set(f"File time: {file_t:.2f}s  ({fmt_hms(file_t)})")
+        # Movie time = position in the clip as played (same as file time for our pipeline)
+        self.info_vars["movie_t"].set(
+            f"Movie time: {fmt_hms(file_t)} / {fmt_hms(self.duration)}  "
+            f"({file_t:.2f}s / {self.duration:.2f}s)"
+        )
 
         if self.kind == "photo" and self.current_path and self.start_time is not None:
             try:
@@ -474,6 +552,9 @@ class DebugApp(ctk.CTk):
                 self.info_vars["factor"].set("Factor: 1× (photo)")
                 self.info_vars["real_t"].set(f"Real (FIT) t: {real_t:.1f}s")
                 self.info_vars["fit_clock"].set(f"FIT clock: {fmt_ts(data['ts'])}")
+                self.info_vars["movie_t"].set(
+                    f"Movie time: still ({fmt_hms(0)} / photo hold)"
+                )
                 self.info_vars["align"].set(f"Photo EXIF≈ {fmt_ts(photo_dt)}  → real_t {real_t:.1f}s")
                 self.info_vars["sample"].set(self._sample_line(data))
             except Exception as e:
@@ -594,6 +675,7 @@ class DebugApp(ctk.CTk):
 
     def on_close(self):
         self.stop_play()
+        self._stop_ffplay()
         if self.cap is not None:
             self.cap.release()
         self.destroy()
