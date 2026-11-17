@@ -11,6 +11,7 @@ Batch (one FIT + MP4s and/or photos):
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -196,6 +197,93 @@ def parse_fit(fit_path):
 # ============================================================
 # Time helpers
 # ============================================================
+def parse_pixel_filename_utc(video_path):
+    """Parse exact UTC start time from Google Pixel filename (PXL_YYYYMMDD_HHMMSSmmm*.mp4)."""
+    if not video_path:
+        return None
+    name = os.path.basename(video_path)
+    m = re.search(r"PXL_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})(?:(\d{3}))?", name, re.IGNORECASE)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = map(int, m.groups()[:6])
+    ms_str = m.group(7)
+    ms = int(ms_str) if ms_str is not None else 0
+    try:
+        return datetime(y, mo, d, h, mi, s, ms * 1000, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_phone_video(video_path):
+    """
+    Detect whether video is a phone recording by filename prefix (PXL_, IMG_)
+    or ffprobe container manufacturer metadata.
+    """
+    if not video_path:
+        return False
+    name = os.path.basename(video_path).upper()
+    if name.startswith("PXL_") or name.startswith("IMG_"):
+        return True
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format_tags=com.android.manufacturer,com.apple.quicktime.make,make,manufacturer",
+        "-of", "default=noprint_wrappers=1",
+        video_path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            line = line.strip()
+            if "=" in line:
+                val = line.split("=", 1)[1].strip()
+                if val:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def get_effective_video_dimensions(video_path):
+    """Return (width, height, rotation) taking rotation metadata into account."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:stream_tags=rotate:side_data=rotation",
+        "-of", "json",
+        video_path,
+    ]
+    try:
+        data = json.loads(subprocess.check_output(cmd, text=True))
+        streams = data.get("streams", [])
+        if not streams:
+            return 1920, 1080, 0
+        stream = streams[0]
+        w = int(stream.get("width", 1920))
+        h = int(stream.get("height", 1080))
+        rotate = 0
+        tags = stream.get("tags", {})
+        if "rotate" in tags:
+            try:
+                rotate = int(tags["rotate"])
+            except ValueError:
+                pass
+        for sd in stream.get("side_data_list", []):
+            if "rotation" in sd:
+                try:
+                    rotate = int(sd["rotation"])
+                except ValueError:
+                    pass
+        if abs(rotate) in (90, 270):
+            return h, w, rotate
+        return w, h, rotate
+    except Exception:
+        try:
+            w, h, _ = get_video_size_fps(video_path)
+            return w, h, 0
+        except Exception:
+            return 1920, 1080, 0
+
+
 def parse_dji_filename_local(video_path):
     name = os.path.basename(video_path)
     m = re.search(r"(?:DJI_)?(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", name)
@@ -240,6 +328,9 @@ def to_utc_naive(dt):
 
 
 def video_sort_key(video_path):
+    pixel = parse_pixel_filename_utc(video_path)
+    if pixel is not None:
+        return (0, pixel.timestamp(), os.path.basename(video_path))
     creation = get_mp4_creation_time_utc(video_path)
     if creation is not None:
         return (0, creation.timestamp(), os.path.basename(video_path))
@@ -313,11 +404,15 @@ def format_display_time(ts, offset_hours):
 
 
 def compute_auto_align_offset(video_path, fit_start):
+    pixel_utc = parse_pixel_filename_utc(video_path)
     creation_utc = get_mp4_creation_time_utc(video_path)
     filename_local = parse_dji_filename_local(video_path)
     video_start = None
     source = None
-    if creation_utc is not None:
+    if pixel_utc is not None:
+        video_start = to_utc_naive(pixel_utc)
+        source = "Pixel filename UTC"
+    elif creation_utc is not None:
         video_start = to_utc_naive(creation_utc)
         source = "mp4 creation_time"
     elif filename_local is not None:
@@ -358,10 +453,188 @@ def photo_align_offset(photo_path, fit_start, offset_hours=0.0):
     return real_t, photo_dt
 
 
+def has_audio_stream(video_path):
+    if not video_path:
+        return False
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type",
+        "-of", "csv=p=0",
+        video_path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def normalize_phone_video_clip(
+    src_video_path, dst_video_path, out_w, out_h, fps,
+    phone_vertical="blur", t0=0.0, t1=None,
+    cam_audio_source=None, cam_audio_t0=None, cam_audio_t1=None,
+):
+    """
+    Normalize phone video clip (or slice [t0, t1]) to project resolution, CFR,
+    yuv420p, and SAR=1 so concat never drifts or fails on VFR phone footage.
+    If vertical (9:16), centers over blurred (-0.12 brightness) or black 16:9 background.
+    If cam_audio_source provided, routes external action-camera audio.
+    Applies 20ms (0.02s) audio fade-in / fade-out at segment boundaries.
+    """
+    total_dur = get_media_duration(src_video_path)
+    t0 = max(0.0, float(t0 or 0.0))
+    t1 = float(t1) if t1 is not None else total_dur
+    t1 = min(total_dur, t1)
+    slice_dur = max(0.01, t1 - t0)
+
+    eff_w, eff_h, _ = get_effective_video_dimensions(src_video_path)
+    is_vertical = (eff_h > eff_w)
+
+    if is_vertical:
+        if phone_vertical == "blur":
+            vf = (
+                f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{out_h},boxblur=25:5,eq=brightness=-0.12[bg];"
+                f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fg];"
+                f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps={fps},format=yuv420p,setsar=1[v]"
+            )
+        else:
+            vf = (
+                f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+                f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,fps={fps},format=yuv420p,setsar=1[v]"
+            )
+    else:
+        vf = (
+            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+            f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:black,fps={fps},format=yuv420p,setsar=1[v]"
+        )
+
+    fade_dur = min(0.02, slice_dur / 2.0)
+    af_fade = (
+        f"aformat=sample_rates=48000:channel_layouts=stereo,"
+        f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={slice_dur - fade_dur:.3f}:d={fade_dur:.3f}[a]"
+    )
+
+    cmd = ["ffmpeg", "-y", "-ss", f"{t0:.6f}", "-to", f"{t1:.6f}", "-i", src_video_path]
+
+    use_cam_audio = (
+        cam_audio_source is not None
+        and cam_audio_t0 is not None
+        and cam_audio_t1 is not None
+        and os.path.exists(cam_audio_source)
+        and has_audio_stream(cam_audio_source)
+    )
+
+    if use_cam_audio:
+        cam_t0_val = max(0.0, float(cam_audio_t0))
+        cam_t1_val = max(cam_t0_val + 0.01, float(cam_audio_t1))
+        cmd.extend(["-ss", f"{cam_t0_val:.6f}", "-to", f"{cam_t1_val:.6f}", "-i", cam_audio_source])
+        filter_complex = f"{vf};[1:a]{af_fade}"
+    else:
+        if has_audio_stream(src_video_path):
+            filter_complex = f"{vf};[0:a]{af_fade}"
+        else:
+            filter_complex = f"{vf};anullsrc=r=48000:cl=stereo:d={slice_dur:.6f},{af_fade}"
+
+    cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:a", "aac",
+        "-t", f"{slice_dur:.6f}",
+        dst_video_path,
+    ])
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    return dst_video_path
+
+
+def compress_silent_video(video_path, segments, factor, out_w=None, out_h=None, fps=None):
+    """
+    Compress silent segments of a 1x action-camera clip by factor using smooth frame blending (tblend/setpts).
+    Spoken commentary segments (sp <= 1.0) stay at 1x, keeping FIT telemetry aligned.
+    Returns (compressed_path, new_segments, was_compressed).
+    """
+    has_silent = any(sp > 1.0 for _, _, sp in segments)
+    if not has_silent or factor <= 1.0:
+        return video_path, segments, False
+
+    src_w, src_h, src_fps = get_video_size_fps(video_path)
+    target_fps = fps or src_fps or 30.0
+    if abs(target_fps - 29.97) < 0.05 or abs(target_fps - 59.94) < 0.05:
+        target_fps = 30.0
+    else:
+        target_fps = max(1.0, round(target_fps, 3))
+
+    has_audio = has_audio_stream(video_path)
+    tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+
+    vf_parts = []
+    af_parts = []
+    concat_inputs = []
+    new_segments = []
+    cur_comp_t = 0.0
+
+    for i, (s, e, sp) in enumerate(segments):
+        orig_dur = e - s
+        if orig_dur <= 0.001:
+            continue
+        if sp > 1.0:
+            f = float(sp)
+            comp_dur = orig_dur / f
+            vf_parts.append(
+                f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,"
+                f"tblend=all_mode=average,setpts=PTS/{f:.6f},fps={target_fps}[v{i}]"
+            )
+            af_parts.append(f"anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a{i}]")
+            new_segments.append((cur_comp_t, cur_comp_t + comp_dur, f))
+            cur_comp_t += comp_dur
+        else:
+            comp_dur = orig_dur
+            vf_parts.append(
+                f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,fps={target_fps}[v{i}]"
+            )
+            if has_audio:
+                af_parts.append(
+                    f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
+                )
+            else:
+                af_parts.append(f"anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a{i}]")
+            new_segments.append((cur_comp_t, cur_comp_t + comp_dur, 1.0))
+            cur_comp_t += comp_dur
+        concat_inputs.append(f"[v{i}][a{i}]")
+
+    if not concat_inputs:
+        return video_path, segments, False
+
+    n_segs = len(concat_inputs)
+    concat_str = "".join(concat_inputs) + f"concat=n={n_segs}:v=1:a=1[outv][outa]"
+    all_filters = ";".join(vf_parts + af_parts) + ";" + concat_str
+
+    print(f"Compressing silent 1x sections ({n_segs} segments) by {factor:g}x with smooth frame blending (tblend/setpts)...")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-filter_complex", all_filters,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:a", "aac",
+        tmp_out,
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    print(f"Compressed 1x video: {get_media_duration(video_path):.1f}s -> {cur_comp_t:.1f}s")
+    return tmp_out, new_segments, True
+
+
 # ============================================================
 # Hyperlapse audio detection
 # ============================================================
 def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, factor=15.0):
+    if is_phone_video(video_path):
+        dur = get_media_duration(video_path)
+        print(f"Phone video ({os.path.basename(video_path)}): locked to 1x speed ({dur:.2f}s)")
+        return [(0.0, dur, 1.0)]
     print("Analyzing audio for hyperlapse / 1x sections...")
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_wav = tmp.name
@@ -1003,140 +1276,212 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
                    auto_align=True, offset_explicit=False,
                    records=None, start_time=None, gps_points=None,
                    factor=15.0, file_t_start=0.0, file_t_end=None,
-                   segments=None, fixed_offset=None, sport=None):
+                   segments=None, fixed_offset=None, sport=None,
+                   phone_vertical="blur", compress_silent=False,
+                   cam_audio_source=None, cam_audio_t0=None, cam_audio_t1=None):
     """Render overlay for a full video or a [file_t_start, file_t_end) slice."""
     if records is None or start_time is None or gps_points is None:
         records, start_time, gps_points = parse_fit(fit_path)
     sport = detect_sport(records, forced=sport, fit_path=fit_path)
     print(f"Panel sport   : {sport}")
 
-    if segments is None:
-        segments = detect_speed_segments(video_path, factor=factor)
-    video_to_real, real_to_video, _total_real = build_time_map(segments)
+    is_phone = is_phone_video(video_path)
+    tmp_cleaned = []
 
-    if fixed_offset is not None:
-        extra_offset = float(fixed_offset)
-        print(f"Alignment     : fixed offset {extra_offset:.1f} s")
-    elif offset_explicit:
-        print(f"Alignment     : manual offset {extra_offset:.1f} s")
-    elif auto_align:
-        auto = compute_auto_align_offset(video_path, start_time)
-        extra_offset = auto if auto is not None else 0.0
-        if auto is None:
-            print("Alignment     : auto-align failed, using 0")
-    else:
-        print(f"Alignment     : auto-align disabled, offset {extra_offset:.1f} s")
+    try:
+        if is_phone:
+            if segments is None:
+                segments = [(0.0, get_media_duration(video_path), 1.0)]
+        elif compress_silent and segments is None:
+            raw_segs = detect_speed_segments(video_path, factor=factor)
+            comp_path, new_segs, was_comp = compress_silent_video(video_path, raw_segs, factor)
+            if was_comp:
+                video_path = comp_path
+                segments = new_segs
+                tmp_cleaned.append(comp_path)
+            else:
+                segments = raw_segs
 
-    offset_hours, offset_desc = resolve_display_offset_hours(video_path, time_mode, utc_offset)
-    print(f"Display time   : {offset_desc}")
+        if segments is None:
+            segments = detect_speed_segments(video_path, factor=factor)
+        video_to_real, real_to_video, _total_real = build_time_map(segments)
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+        if fixed_offset is not None:
+            extra_offset = float(fixed_offset)
+            print(f"Alignment     : fixed offset {extra_offset:.1f} s")
+        elif offset_explicit:
+            print(f"Alignment     : manual offset {extra_offset:.1f} s")
+        elif auto_align:
+            auto = compute_auto_align_offset(video_path, start_time)
+            extra_offset = auto if auto is not None else 0.0
+            if auto is None:
+                print("Alignment     : auto-align failed, using 0")
+        else:
+            print(f"Alignment     : auto-align disabled, offset {extra_offset:.1f} s")
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = frame_count / fps if fps > 0 else 0
+        offset_hours, offset_desc = resolve_display_offset_hours(video_path, time_mode, utc_offset)
+        print(f"Display time   : {offset_desc}")
 
-    t0 = max(0.0, float(file_t_start or 0.0))
-    t1 = float(file_t_end) if file_t_end is not None else duration
-    t1 = min(duration, t1)
-    if t1 <= t0 + 0.05:
-        raise RuntimeError(f"Empty video slice {t0:.2f}-{t1:.2f}s in {video_path}")
+        eff_w, eff_h, _ = get_effective_video_dimensions(video_path)
+        is_vertical = (eff_h > eff_w)
 
-    if preview:
-        out_h = 1080
-        out_w = int(src_w * (out_h / src_h))
-        if out_w % 2:
-            out_w += 1
-        print(f"Preview mode: scaling {src_w}x{src_h} → {out_w}x{out_h}")
-    else:
-        out_w, out_h = src_w, src_h
-
-    slice_note = ""
-    if t0 > 0.01 or t1 < duration - 0.01:
-        slice_note = f" | slice {t0:.2f}-{t1:.2f}s"
-    print(f"Video: {duration:.1f}s | src {src_w}x{src_h} | out {out_w}x{out_h} | {fps:.3f} fps{slice_note}")
-
-    times, arrays, clock = precompute_data(
-        records, start_time, gps_points, video_to_real,
-        duration, extra_offset, step=step,
-    )
-    fonts = load_fonts(out_w)
-
-    tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    writer = cv2.VideoWriter(tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
-    if not writer.isOpened():
-        raise RuntimeError("Could not open VideoWriter")
-
-    cache = {}
-    print("Rendering frames...")
-    # Seek near start of slice
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t0 * fps) - 1))
-    # Drain until we reach t0
-    while True:
-        pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
-        if pos >= t0 * fps - 0.5:
-            break
-        ok, _ = cap.read()
-        if not ok:
-            break
-
-    frames_written = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-        t = frame_idx / fps if fps > 0 else 0.0
-        if t < t0 - 1.0 / max(fps, 1):
-            continue
-        if t >= t1:
-            break
-
-        if preview and (frame.shape[1] != out_w or frame.shape[0] != out_h):
-            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
-
-        idx = int(round(t / step))
-        idx = max(0, min(idx, len(times) - 1))
-        if idx not in cache:
-            cache[idx] = make_overlay_rgba(
-                idx, arrays, clock,
-                gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
+        # In single-clip mode, if phone video is vertical, normalize it to 16:9 canvas
+        if is_phone and is_vertical:
+            target_w = 1920
+            target_h = 1080
+            tmp_norm = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            tmp_cleaned.append(tmp_norm)
+            fps_val = get_video_size_fps(video_path)[2] or 30.0
+            print(f"Normalizing vertical phone clip to 16:9 with {phone_vertical} background...")
+            normalize_phone_video_clip(
+                video_path, tmp_norm, target_w, target_h, fps_val,
+                phone_vertical=phone_vertical, t0=file_t_start, t1=file_t_end,
+                cam_audio_source=cam_audio_source,
+                cam_audio_t0=cam_audio_t0, cam_audio_t1=cam_audio_t1,
             )
-        writer.write(alpha_blend(frame, cache[idx]))
-        frames_written += 1
-        if frames_written % 300 == 0:
-            print(f"  slice frames {frames_written} (t≈{t:.1f}s)")
+            video_path = tmp_norm
+            file_t_start = 0.0
+            file_t_end = get_media_duration(tmp_norm)
+            segments = [(0.0, file_t_end, 1.0)]
+            video_to_real, real_to_video, _total_real = build_time_map(segments)
 
-    cap.release()
-    writer.release()
-    if frames_written == 0:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0
+
+        t0 = max(0.0, float(file_t_start or 0.0))
+        t1 = float(file_t_end) if file_t_end is not None else duration
+        t1 = min(duration, t1)
+        if t1 <= t0 + 0.05:
+            raise RuntimeError(f"Empty video slice {t0:.2f}-{t1:.2f}s in {video_path}")
+
+        if preview:
+            out_h = 1080
+            out_w = int(src_w * (out_h / src_h))
+            if out_w % 2:
+                out_w += 1
+            print(f"Preview mode: scaling {src_w}x{src_h} → {out_w}x{out_h}")
+        else:
+            out_w, out_h = src_w, src_h
+
+        slice_note = ""
+        if t0 > 0.01 or t1 < duration - 0.01:
+            slice_note = f" | slice {t0:.2f}-{t1:.2f}s"
+        print(f"Video: {duration:.1f}s | src {src_w}x{src_h} | out {out_w}x{out_h} | {fps:.3f} fps{slice_note}")
+
+        times, arrays, clock = precompute_data(
+            records, start_time, gps_points, video_to_real,
+            duration, extra_offset, step=step,
+        )
+        fonts = load_fonts(out_w)
+
+        tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+        writer = cv2.VideoWriter(tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
+        if not writer.isOpened():
+            raise RuntimeError("Could not open VideoWriter")
+
+        cache = {}
+        print("Rendering frames...")
+        # Seek near start of slice
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t0 * fps) - 1))
+        # Drain until we reach t0
+        while True:
+            pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+            if pos >= t0 * fps - 0.5:
+                break
+            ok, _ = cap.read()
+            if not ok:
+                break
+
+        frames_written = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            t = frame_idx / fps if fps > 0 else 0.0
+            if t < t0 - 1.0 / max(fps, 1):
+                continue
+            if t >= t1:
+                break
+
+            if preview and (frame.shape[1] != out_w or frame.shape[0] != out_h):
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+            idx = int(round(t / step))
+            idx = max(0, min(idx, len(times) - 1))
+            if idx not in cache:
+                cache[idx] = make_overlay_rgba(
+                    idx, arrays, clock,
+                    gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
+                )
+            writer.write(alpha_blend(frame, cache[idx]))
+            frames_written += 1
+            if frames_written % 300 == 0:
+                print(f"  slice frames {frames_written} (t≈{t:.1f}s)")
+
+        cap.release()
+        writer.release()
+        if frames_written == 0:
+            os.remove(tmp_video)
+            raise RuntimeError(f"No frames written for slice {t0}-{t1} of {video_path}")
+
+        print("Muxing audio with ffmpeg (20ms afade)...")
+        dur = t1 - t0
+        fade_dur = min(0.02, dur / 2.0)
+        has_audio = has_audio_stream(video_path)
+        if has_audio:
+            af = (
+                f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur - fade_dur:.3f}:d={fade_dur:.3f}"
+            )
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-ss", f"{t0:.6f}",
+                "-to", f"{t1:.6f}",
+                "-i", video_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-af", af,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-shortest",
+                output_path,
+            ]
+        else:
+            af = f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur - fade_dur:.3f}:d={fade_dur:.3f}"
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", tmp_video,
+                "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur:.6f}",
+                "-af", af,
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-shortest",
+                output_path,
+            ]
+        subprocess.run(cmd, check=True)
         os.remove(tmp_video)
-        raise RuntimeError(f"No frames written for slice {t0}-{t1} of {video_path}")
-
-    print("Muxing audio with ffmpeg...")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", tmp_video,
-        "-ss", f"{t0:.6f}",
-        "-to", f"{t1:.6f}",
-        "-i", video_path,
-        "-map", "0:v:0",
-        "-map", "1:a:0?",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-shortest",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True)
-    os.remove(tmp_video)
-    print(f"\nDone clip → {output_path}")
-    return output_path
+        print(f"\nDone clip → {output_path}")
+        return output_path
+    finally:
+        for p in tmp_cleaned:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 
 
@@ -1169,11 +1514,15 @@ def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
         writer.write(frame)
     writer.release()
 
-    # silent audio track so concat with video clips is happier
+    # silent audio track with 20ms fade so concat with video clips is happier
+    dur_f = float(photo_seconds)
+    fade_dur = min(0.02, dur_f / 2.0)
+    af = f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur_f - fade_dur:.3f}:d={fade_dur:.3f}"
     cmd = [
         "ffmpeg", "-y",
         "-i", tmp_video,
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur_f:.6f}",
+        "-af", af,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "23",
@@ -1415,10 +1764,16 @@ def concat_videos(video_paths, output_path, transition_seconds=0.0):
 
 def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
                      extra_offset, auto_align, offset_explicit, factor,
-                     time_mode, utc_offset):
+                     time_mode, utc_offset,
+                     phone_priority=True, phone_vertical="blur",
+                     keep_camera_audio=False, compress_silent=False):
     """
     Build ordered render plan: video slices and photos.
-    Photos whose time falls inside a video are inserted mid-clip (split video).
+    - Phone Video Priority: carves overlapping action-camera video intervals around phone videos
+      on the FIT timeline (dropping camera fragments < 0.5s).
+    - Phone videos locked to 1x speed.
+    - Action-camera clips with --compress-silent compress silent segments by factor via tblend/setpts.
+    - Mid-clip photos: stills falling inside carved slices split those slices.
     """
     ref_video = videos[0] if videos else None
     offset_hours, offset_desc = resolve_display_offset_hours(ref_video, time_mode, utc_offset)
@@ -1431,14 +1786,34 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
         photo_meta.append({"path": ph, "real_t": real_t, "dt": pdt})
     photo_meta.sort(key=lambda p: p["real_t"])
 
-    used = set()
-    plan = []  # list of {"kind", "path", ... "sort_key"}
-
+    # Analyze and prepare video metadata
+    video_meta = []
     for vpath in videos:
         print("=" * 60)
-        print(f"Planning splits for: {os.path.basename(vpath)}")
+        print(f"Analyzing: {os.path.basename(vpath)}")
         print("=" * 60)
-        segments = detect_speed_segments(vpath, factor=factor)
+        is_phone = is_phone_video(vpath)
+
+        cap = cv2.VideoCapture(vpath)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0.0
+        cap.release()
+
+        effective_path = vpath
+        if is_phone:
+            print(f"  Phone video ({os.path.basename(vpath)}): locked to 1x speed ({duration:.2f}s)")
+            segments = [(0.0, duration, 1.0)]
+        else:
+            if compress_silent:
+                raw_segments = detect_speed_segments(vpath, factor=factor)
+                comp_path, new_segments, was_comp = compress_silent_video(vpath, raw_segments, factor)
+                effective_path = comp_path
+                segments = new_segments
+                duration = segments[-1][1] if segments else duration
+            else:
+                segments = detect_speed_segments(vpath, factor=factor)
+
         video_to_real, real_to_video, total_real = build_time_map(segments)
 
         if offset_explicit:
@@ -1449,52 +1824,173 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
         else:
             align = float(extra_offset)
 
-        cap = cv2.VideoCapture(vpath)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = frame_count / fps if fps > 0 else 0.0
-        cap.release()
-
         v_real0 = align + video_to_real(0.0)
         v_real1 = align + video_to_real(duration)
 
+        video_meta.append({
+            "orig_path": vpath,
+            "path": effective_path,
+            "is_phone": is_phone,
+            "duration": duration,
+            "segments": segments,
+            "video_to_real": video_to_real,
+            "real_to_video": real_to_video,
+            "align": align,
+            "real_start": v_real0,
+            "real_end": v_real1,
+        })
+
+    # Phone Video Priority & Interval Carving
+    if phone_priority:
+        phone_vids = [v for v in video_meta if v["is_phone"]]
+        cam_vids = [v for v in video_meta if not v["is_phone"]]
+
+        # Audio routing from overlapping action camera clip if keep_camera_audio
+        if keep_camera_audio:
+            for p in phone_vids:
+                for c in cam_vids:
+                    ovlp_start = max(p["real_start"], c["real_start"])
+                    ovlp_end = min(p["real_end"], c["real_end"])
+                    if ovlp_end - ovlp_start > 0.0:
+                        cam_t0 = c["real_to_video"](p["real_start"] - c["align"])
+                        cam_t1 = c["real_to_video"](p["real_end"] - c["align"])
+                        p["cam_audio_source"] = c["path"]
+                        p["cam_audio_t0"] = cam_t0
+                        p["cam_audio_t1"] = cam_t1
+                        print(f"Audio routing: {os.path.basename(p['orig_path'])} <- {os.path.basename(c['orig_path'])} ({cam_t0:.2f}s..{cam_t1:.2f}s)")
+                        break
+
+        # Carve each action-camera interval around phone intervals on FIT timeline
+        carved_cam_slices = []
+        for c in cam_vids:
+            intervals = [(c["real_start"], c["real_end"])]
+            for p in phone_vids:
+                p0, p1 = p["real_start"], p["real_end"]
+                next_intervals = []
+                for a0, a1 in intervals:
+                    if p1 <= a0 or p0 >= a1:
+                        next_intervals.append((a0, a1))
+                    else:
+                        if a0 < p0:
+                            next_intervals.append((a0, p0))
+                        if p1 < a1:
+                            next_intervals.append((p1, a1))
+                intervals = next_intervals
+
+            for r0, r1 in intervals:
+                t0 = c["real_to_video"](r0 - c["align"])
+                t1 = c["real_to_video"](r1 - c["align"])
+                t0 = max(0.0, min(c["duration"], float(t0)))
+                t1 = max(0.0, min(c["duration"], float(t1)))
+                frag_dur = t1 - t0
+                if frag_dur >= 0.5:
+                    carved_cam_slices.append({
+                        "orig_path": c["orig_path"],
+                        "path": c["path"],
+                        "is_phone": False,
+                        "t0": t0,
+                        "t1": t1,
+                        "align": c["align"],
+                        "segments": c["segments"],
+                        "video_to_real": c["video_to_real"],
+                        "real_to_video": c["real_to_video"],
+                        "real_start": r0,
+                        "real_end": r1,
+                    })
+                else:
+                    print(f"Dropped short camera fragment ({frag_dur:.2f}s < 0.5s) from {os.path.basename(c['orig_path'])}")
+
+        base_slices = []
+        for p in phone_vids:
+            base_slices.append({
+                "orig_path": p["orig_path"],
+                "path": p["path"],
+                "is_phone": True,
+                "t0": 0.0,
+                "t1": p["duration"],
+                "align": p["align"],
+                "segments": p["segments"],
+                "video_to_real": p["video_to_real"],
+                "real_to_video": p["real_to_video"],
+                "real_start": p["real_start"],
+                "real_end": p["real_end"],
+                "cam_audio_source": p.get("cam_audio_source"),
+                "cam_audio_t0": p.get("cam_audio_t0"),
+                "cam_audio_t1": p.get("cam_audio_t1"),
+            })
+        base_slices.extend(carved_cam_slices)
+    else:
+        base_slices = []
+        for v in video_meta:
+            base_slices.append({
+                "orig_path": v["orig_path"],
+                "path": v["path"],
+                "is_phone": v["is_phone"],
+                "t0": 0.0,
+                "t1": v["duration"],
+                "align": v["align"],
+                "segments": v["segments"],
+                "video_to_real": v["video_to_real"],
+                "real_to_video": v["real_to_video"],
+                "real_start": v["real_start"],
+                "real_end": v["real_end"],
+            })
+
+    # Mid-clip photo splitting
+    used_photos = set()
+    plan = []
+
+    for s in base_slices:
+        v_real0 = s["real_start"]
+        v_real1 = s["real_end"]
+        t0 = s["t0"]
+        t1 = s["t1"]
+        align = s["align"]
+        real_to_video = s["real_to_video"]
+        video_to_real = s["video_to_real"]
+
         inside = [
             p for p in photo_meta
-            if p["path"] not in used and v_real0 < p["real_t"] < v_real1
+            if p["path"] not in used_photos and v_real0 < p["real_t"] < v_real1
         ]
         inside.sort(key=lambda p: p["real_t"])
 
-        # Build cut list: file times with optional photos at each cut (except 0)
-        cuts = [0.0]
-        photos_after_cut = {}  # file_t -> [photo, ...]
+        cuts = [round(t0, 3)]
+        photos_after_cut = {}
         for p in inside:
             vt = real_to_video(p["real_t"] - align)
-            vt = max(0.0, min(duration, float(vt)))
-            # quantize slightly to merge near-duplicates
+            vt = max(t0, min(t1, float(vt)))
             key = round(vt, 2)
             cuts.append(key)
             photos_after_cut.setdefault(key, []).append(p)
-            used.add(p["path"])
-        cuts.append(round(duration, 3))
+            used_photos.add(p["path"])
+        cuts.append(round(t1, 3))
         cuts = sorted(set(cuts))
-
-        print(f"  file duration {duration:.2f}s | real window {v_real0:.1f}..{v_real1:.1f}s into FIT")
-        print(f"  mid-clip photos: {len(inside)} | split points: {cuts}")
 
         for i in range(len(cuts) - 1):
             a, b = cuts[i], cuts[i + 1]
             if b - a >= 0.08:
                 sort_key = align + video_to_real(a)
-                plan.append({
+                item = {
                     "kind": "video_slice",
-                    "path": vpath,
+                    "orig_path": s["orig_path"],
+                    "path": s["path"],
+                    "is_phone": s["is_phone"],
                     "t0": a,
                     "t1": b,
                     "align": align,
-                    "segments": segments,
+                    "segments": s["segments"],
                     "sort_key": sort_key,
-                })
-            # photos at cut b (start of next piece / end of this)
+                }
+                if s.get("cam_audio_source"):
+                    offset_in_phone = a - t0
+                    slice_dur = b - a
+                    cam_base_t0 = s["cam_audio_t0"]
+                    item["cam_audio_source"] = s["cam_audio_source"]
+                    item["cam_audio_t0"] = cam_base_t0 + offset_in_phone
+                    item["cam_audio_t1"] = cam_base_t0 + offset_in_phone + slice_dur
+                plan.append(item)
+
             for p in photos_after_cut.get(cuts[i + 1], []):
                 plan.append({
                     "kind": "photo",
@@ -1502,24 +1998,25 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
                     "sort_key": p["real_t"],
                 })
 
-    # Photos not inside any video: place by real_t
     for p in photo_meta:
-        if p["path"] not in used:
+        if p["path"] not in used_photos:
             plan.append({
                 "kind": "photo",
                 "path": p["path"],
                 "sort_key": p["real_t"],
             })
-            used.add(p["path"])
+            used_photos.add(p["path"])
 
-    # On equal sort_key, put photo before the video_slice that starts at the same real time
-    # so mid-clip photos land between the two slices instead of after the remaining video.
     plan.sort(key=lambda e: (e["sort_key"], 0 if e["kind"] == "photo" else 1, e["path"]))
 
     print("\nFinal render plan:")
     for i, e in enumerate(plan, 1):
         if e["kind"] == "video_slice":
-            print(f"  {i}. [video] {os.path.basename(e['path'])}  {e['t0']:.2f}-{e['t1']:.2f}s")
+            tag = ""
+            if e.get("is_phone"):
+                cam_note = " (+cam_audio)" if e.get("cam_audio_source") and keep_camera_audio else ""
+                tag = f"  PHONE [PRIORITY]{cam_note}"
+            print(f"  {i}. [video] {os.path.basename(e['orig_path'])}  {e['t0']:.2f}-{e['t1']:.2f}s{tag}")
         else:
             print(f"  {i}. [photo] {os.path.basename(e['path'])}")
     print()
@@ -1528,7 +2025,9 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
 
 def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
               time_mode="auto", utc_offset=None, auto_align=True, offset_explicit=False,
-              factor=15.0, photo_seconds=3.0, transition_seconds=0.0, sport=None):
+              factor=15.0, photo_seconds=3.0, transition_seconds=0.0, sport=None,
+              phone_priority=True, phone_vertical="blur",
+              keep_camera_audio=False, compress_silent=False):
     fit_path, videos, photos = discover_batch(folder)
     records, start_time, gps_points = parse_fit(fit_path)
     sport = detect_sport(records, forced=sport, fit_path=fit_path)
@@ -1538,27 +2037,43 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
         videos, photos, fit_path, records, start_time, gps_points,
         extra_offset, auto_align, offset_explicit, factor,
         time_mode, utc_offset,
+        phone_priority=phone_priority, phone_vertical=phone_vertical,
+        keep_camera_audio=keep_camera_audio, compress_silent=compress_silent,
     )
     if not plan:
         raise RuntimeError("Batch plan is empty")
 
-    # Output size from first video slice or default
-    first_video = next((e["path"] for e in plan if e["kind"] == "video_slice"), None)
-    if first_video:
-        cap = cv2.VideoCapture(first_video)
-        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
-        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        cap.release()
-        if preview:
-            out_h = 1080
-            out_w = int(src_w * (out_h / src_h))
-            if out_w % 2:
-                out_w += 1
+    # Target resolution: prefer landscape action camera video dimensions
+    cam_vids = [e["path"] for e in plan if e["kind"] == "video_slice" and not e.get("is_phone")]
+    all_vids = [e["path"] for e in plan if e["kind"] == "video_slice"]
+    ref_vid = cam_vids[0] if cam_vids else (all_vids[0] if all_vids else None)
+
+    if ref_vid:
+        w, h, _ = get_effective_video_dimensions(ref_vid)
+        _, _, fps = get_video_size_fps(ref_vid)
+        if w < h:
+            out_w, out_h = 1920, 1080
         else:
-            out_w, out_h = src_w, src_h
+            out_w, out_h = w, h
     else:
         out_w, out_h, fps = 1920, 1080, 30.0
+
+    if abs(fps - 29.97) < 0.05 or abs(fps - 59.94) < 0.05:
+        fps = 30.0
+    else:
+        fps = max(1.0, round(fps, 3))
+
+    if preview:
+        out_h = 1080
+        out_w = int(out_w * (1080.0 / out_h))
+        if out_w % 2:
+            out_w += 1
+        out_h = 1080
+    else:
+        if out_w % 2:
+            out_w += 1
+        if out_h % 2:
+            out_h += 1
 
     ref_video = videos[0] if videos else None
     tmp_dir = tempfile.mkdtemp(prefix="overlay_batch_")
@@ -1568,25 +2083,56 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
         for i, e in enumerate(plan, 1):
             print("=" * 60)
             if e["kind"] == "video_slice":
-                print(f"Batch item {i}/{len(plan)}: [video] {os.path.basename(e['path'])} "
-                      f"{e['t0']:.2f}-{e['t1']:.2f}s")
+                tag = ""
+                if e.get("is_phone"):
+                    cam_note = " (+cam_audio)" if e.get("cam_audio_source") and keep_camera_audio else ""
+                    tag = f" PHONE [PRIORITY]{cam_note}"
+                print(f"Batch item {i}/{len(plan)}: [video] {os.path.basename(e['orig_path'])} "
+                      f"{e['t0']:.2f}-{e['t1']:.2f}s{tag}")
             else:
                 print(f"Batch item {i}/{len(plan)}: [photo] {os.path.basename(e['path'])}")
             print("=" * 60)
             out_clip = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
 
             if e["kind"] == "video_slice":
-                create_overlay(
-                    e["path"], fit_path, output_path=out_clip,
-                    extra_offset=extra_offset, step=step, preview=preview,
-                    time_mode=time_mode, utc_offset=utc_offset,
-                    auto_align=False, offset_explicit=False,
-                    records=records, start_time=start_time, gps_points=gps_points,
-                    factor=factor,
-                    file_t_start=e["t0"], file_t_end=e["t1"],
-                    segments=e["segments"], fixed_offset=e["align"],
-                    sport=sport,
-                )
+                if e.get("is_phone"):
+                    norm_slice = os.path.join(tmp_dir, f"norm_phone_{i:03d}.mp4")
+                    normalize_phone_video_clip(
+                        src_video_path=e["orig_path"],
+                        dst_video_path=norm_slice,
+                        out_w=out_w, out_h=out_h, fps=fps,
+                        phone_vertical=phone_vertical,
+                        t0=e["t0"], t1=e["t1"],
+                        cam_audio_source=e.get("cam_audio_source") if keep_camera_audio else None,
+                        cam_audio_t0=e.get("cam_audio_t0"),
+                        cam_audio_t1=e.get("cam_audio_t1"),
+                    )
+                    slice_dur = e["t1"] - e["t0"]
+                    create_overlay(
+                        norm_slice, fit_path, output_path=out_clip,
+                        extra_offset=extra_offset, step=step, preview=False,
+                        time_mode=time_mode, utc_offset=utc_offset,
+                        auto_align=False, offset_explicit=False,
+                        records=records, start_time=start_time, gps_points=gps_points,
+                        factor=1.0,
+                        file_t_start=0.0, file_t_end=slice_dur,
+                        segments=[(0.0, slice_dur, 1.0)], fixed_offset=e["align"] + e["t0"],
+                        sport=sport,
+                    )
+                    if os.path.exists(norm_slice):
+                        os.remove(norm_slice)
+                else:
+                    create_overlay(
+                        e["path"], fit_path, output_path=out_clip,
+                        extra_offset=extra_offset, step=step, preview=preview,
+                        time_mode=time_mode, utc_offset=utc_offset,
+                        auto_align=False, offset_explicit=False,
+                        records=records, start_time=start_time, gps_points=gps_points,
+                        factor=factor,
+                        file_t_start=e["t0"], file_t_end=e["t1"],
+                        segments=e["segments"], fixed_offset=e["align"],
+                        sport=sport,
+                    )
             else:
                 create_photo_clip(
                     e["path"], out_clip, records, start_time, gps_points,
@@ -1609,7 +2155,6 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
             os.rmdir(tmp_dir)
         except OSError:
             pass
-
 
 
 def main():
@@ -1637,6 +2182,16 @@ def main():
     p.add_argument("--sport", choices=("auto", "outdoor", "dive", "freedive", "scuba"),
                    default="auto",
                    help="Panel field set: auto detects dive from FIT depth samples")
+    p.add_argument("--phone-priority", dest="phone_priority", action="store_true", default=True,
+                   help="Prioritize phone videos and carve overlapping camera intervals (default: on)")
+    p.add_argument("--no-phone-priority", dest="phone_priority", action="store_false",
+                   help="Disable phone video priority and interval carving")
+    p.add_argument("--phone-vertical", choices=("blur", "black"), default="blur",
+                   help="Background for vertical (9:16) phone videos: blur or black (default: blur)")
+    p.add_argument("--keep-camera-audio", action="store_true", default=False,
+                   help="Route action-camera audio onto overlapping phone clips (default: off)")
+    p.add_argument("--compress-silent", action="store_true", default=False,
+                   help="Compress silent segments in 1x action-camera clips by --factor using tblend/setpts (default: off)")
     args = p.parse_args()
 
     offset_explicit = args.offset is not None
@@ -1652,6 +2207,8 @@ def main():
             auto_align=args.auto_align, offset_explicit=offset_explicit,
             factor=args.factor, photo_seconds=args.photo_seconds,
             transition_seconds=args.transition_seconds, sport=sport,
+            phone_priority=args.phone_priority, phone_vertical=args.phone_vertical,
+            keep_camera_audio=args.keep_camera_audio, compress_silent=args.compress_silent,
         )
         return
 
@@ -1665,6 +2222,7 @@ def main():
         time_mode=args.time, utc_offset=args.utc_offset,
         auto_align=args.auto_align, offset_explicit=offset_explicit,
         factor=args.factor, sport=sport,
+        phone_vertical=args.phone_vertical, compress_silent=args.compress_silent,
     )
 
 

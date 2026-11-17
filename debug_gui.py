@@ -15,10 +15,20 @@ import os
 import subprocess
 import sys
 import threading
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:
+    sys.exit(
+        "Error: 'tkinter' is not installed or accessible.\n"
+        "On Debian/Ubuntu/Pop!_OS, install it by running:\n"
+        "  ./install_overlay.sh\n"
+        "or:\n"
+        "  sudo apt-get install -y python3-tk"
+    )
 
 import cv2
 import numpy as np
@@ -142,18 +152,50 @@ class DebugApp(ctk.CTk):
         )
         self.sport_menu.pack(side="left", padx=(0, 8))
 
+        # Controls bar for V1.2 features
+        opt_bar = ctk.CTkFrame(self)
+        opt_bar.pack(fill="x", padx=10, pady=(0, 6))
+
+        self.phone_priority_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(opt_bar, text="Phone Priority", variable=self.phone_priority_var).pack(
+            side="left", padx=(8, 12), pady=4
+        )
+
+        ctk.CTkLabel(opt_bar, text="Vertical:").pack(side="left", padx=(0, 4))
+        self.phone_vertical_var = ctk.StringVar(value="blur")
+        ctk.CTkOptionMenu(
+            opt_bar, variable=self.phone_vertical_var, values=["blur", "black"],
+            width=80,
+        ).pack(side="left", padx=(0, 12))
+
+        self.keep_cam_audio_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opt_bar, text="Keep Cam Audio", variable=self.keep_cam_audio_var).pack(
+            side="left", padx=(0, 12), pady=4
+        )
+
+        self.compress_silent_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(opt_bar, text="Compress Silent (1x)", variable=self.compress_silent_var,
+                        command=self.on_compress_silent_change).pack(
+            side="left", padx=(0, 8), pady=4
+        )
+
         body = ctk.CTkFrame(self)
         body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
-        # Left: media list
-        left = ctk.CTkFrame(body, width=260)
+        # Left: media list (wider + horizontal scroll for long filenames)
+        left = ctk.CTkFrame(body, width=360)
         left.pack(side="left", fill="y", padx=(0, 8))
         left.pack_propagate(False)
         ctk.CTkLabel(left, text="Media", font=ctk.CTkFont(weight="bold")).pack(
             anchor="w", padx=8, pady=(8, 4)
         )
-        self.media_list = ctk.CTkScrollableFrame(left, width=240)
-        self.media_list.pack(fill="both", expand=True, padx=4, pady=4)
+        self.media_list = ctk.CTkScrollableFrame(left, width=335)
+        self.media_list.pack(fill="both", expand=True, padx=4, pady=(4, 0))
+        h_scroll = ctk.CTkScrollbar(
+            left, orientation="horizontal", command=self.media_list._parent_canvas.xview
+        )
+        h_scroll.pack(fill="x", padx=4, pady=(2, 4))
+        self.media_list._parent_canvas.configure(xscrollcommand=h_scroll.set)
         self._media_buttons: list = []
 
         # Center: preview + transport
@@ -280,26 +322,31 @@ class DebugApp(ctk.CTk):
         self.log(f"FIT: {Path(fit_path).name}  start={start_time}  points={len(records)}")
         self.log(f"Videos={len(videos)}  Photos={len(photos)}  sport={sport_detail}")
 
-        for w in self._media_buttons:
+        for item in self._media_buttons:
+            w = item[1] if isinstance(item, tuple) else item
             w.destroy()
         self._media_buttons.clear()
 
         for v in videos:
             name = Path(v).name
+            is_phone = wo.is_phone_video(v)
+            tag = "📱 [PHONE]" if is_phone else "🎬 [CAM]"
+            label = f"{tag} {name}"
             b = ctk.CTkButton(
-                self.media_list, text=f"▶ {name}", anchor="w",
+                self.media_list, text=label, anchor="w",
                 command=lambda p=v: self.select_clip(p, "video"),
             )
             b.pack(fill="x", pady=2, padx=2)
-            self._media_buttons.append(b)
+            self._media_buttons.append((v, b, label))
         for ph in photos:
             name = Path(ph).name
+            label = f"🖼 {name}"
             b = ctk.CTkButton(
-                self.media_list, text=f"🖼 {name}", anchor="w",
+                self.media_list, text=label, anchor="w",
                 command=lambda p=ph: self.select_clip(p, "photo"),
             )
             b.pack(fill="x", pady=2, padx=2)
-            self._media_buttons.append(b)
+            self._media_buttons.append((ph, b, label))
 
         if videos:
             self.select_clip(videos[0], "video")
@@ -311,6 +358,10 @@ class DebugApp(ctk.CTk):
             self.factor = float(self.factor_var.get())
         except ValueError:
             self.factor = 15.0
+        if self.current_path and self.kind == "video":
+            self.reanalyze()
+
+    def on_compress_silent_change(self):
         if self.current_path and self.kind == "video":
             self.reanalyze()
 
@@ -330,6 +381,14 @@ class DebugApp(ctk.CTk):
         self.stop_play()
         self.current_path = path
         self.kind = kind
+        default_fg = ctk.ThemeManager.theme["CTkButton"]["fg_color"]
+        for item in self._media_buttons:
+            if isinstance(item, tuple):
+                item_path, btn, base_label = item
+                if item_path == path:
+                    btn.configure(fg_color="#D97706", text=f"▶ {base_label}")
+                else:
+                    btn.configure(fg_color=default_fg, text=base_label)
         self.log(f"Select [{kind}] {Path(path).name}")
 
         if self.cap is not None:
@@ -622,6 +681,10 @@ class DebugApp(ctk.CTk):
                 self.records, self.start_time, self.gps_points,
                 extra_offset=0.0, auto_align=True, offset_explicit=False,
                 factor=self.factor, time_mode="auto", utc_offset=None,
+                phone_priority=self.phone_priority_var.get(),
+                phone_vertical=self.phone_vertical_var.get(),
+                keep_camera_audio=self.keep_cam_audio_var.get(),
+                compress_silent=self.compress_silent_var.get(),
             )
         except Exception as e:
             messagebox.showerror("Plan", str(e))
@@ -629,8 +692,13 @@ class DebugApp(ctk.CTk):
         lines = ["Final render plan:"]
         for i, e in enumerate(plan, 1):
             if e["kind"] == "video_slice":
+                tag = ""
+                if e.get("is_phone"):
+                    cam_note = " (+cam_audio)" if e.get("cam_audio_source") and self.keep_cam_audio_var.get() else ""
+                    tag = f"  PHONE [PRIORITY]{cam_note}"
+                fname = Path(e.get("orig_path") or e["path"]).name
                 lines.append(
-                    f"  {i}. [video] {Path(e['path']).name}  {e['t0']:.2f}-{e['t1']:.2f}s"
+                    f"  {i}. [video] {fname}  {e['t0']:.2f}-{e['t1']:.2f}s{tag}"
                 )
             else:
                 lines.append(f"  {i}. [photo] {Path(e['path']).name}")
@@ -638,7 +706,7 @@ class DebugApp(ctk.CTk):
         self.log(text)
         win = ctk.CTkToplevel(self)
         win.title("Render plan")
-        win.geometry("560x400")
+        win.geometry("620x440")
         box = ctk.CTkTextbox(win, font=ctk.CTkFont(family="monospace", size=12))
         box.pack(fill="both", expand=True, padx=8, pady=8)
         box.insert("end", text)
@@ -652,9 +720,19 @@ class DebugApp(ctk.CTk):
             f"kind={self.kind}",
             f"sport={self.sport}",
             f"factor_setting={self.factor}",
+            f"phone_priority={self.phone_priority_var.get()}",
+            f"phone_vertical={self.phone_vertical_var.get()}",
+            f"keep_camera_audio={self.keep_cam_audio_var.get()}",
+            f"compress_silent={self.compress_silent_var.get()}",
             f"file_t={t:.3f}",
             f"align={self.align_note} offset={self.align_offset:.3f}",
         ]
+        if self.current_path and self.kind == "video":
+            is_phone = wo.is_phone_video(self.current_path)
+            lines.append(f"is_phone={is_phone}")
+            if is_phone:
+                cam_note = " (+cam_audio)" if self.keep_cam_audio_var.get() else ""
+                lines.append(f"phone_priority_status=PHONE [PRIORITY]{cam_note} (locked 1x)")
         if self.segments and self.video_to_real:
             fac = factor_at(self.segments, t)
             real_t = self.video_to_real(t) + self.align_offset

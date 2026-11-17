@@ -1,9 +1,9 @@
 # Workout Overlay
 
-**Version 1.1** — DJI Osmo + Zepp/Amazfit FIT on Linux
+**Version 1.2** — DJI Osmo + Phone Videos + Zepp/Amazfit FIT on Linux
 
 Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
-Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions, outdoor and **dive** panels.
+Built for real outings: one workout FIT, many Osmo and phone clips (with phone video priority), photos taken between or **during** clips, optional hyperlapse, batch export with transitions, outdoor and **dive** panels.
 
 <img width="1931" height="1194" alt="Screenshot_2026-10-09_16-58-32" src="https://github.com/user-attachments/assets/2f17610c-0349-44d3-9c2a-2d8c9ad54cb3" />
 
@@ -11,9 +11,13 @@ Built for real outings: one workout FIT, many Osmo (or phone) clips, photos take
 ## Features
 
 - **Single clip** or **batch folder** (one `.fit` + many videos/photos)
+- **Phone Video Priority & Interval Carving** (`--phone-priority`, default on; `--no-phone-priority`): Auto-detects phone clips (by `PXL_`/`IMG_` prefix or container metadata), parses exact UTC start times for Google Pixel files (`PXL_YYYYMMDD_HHMMSSmmm.mp4`), locks phone videos to 1× speed, carves overlapping action-camera footage around phone cutaways on the FIT timeline, and drops short fragments (< 0.5s) for clean transitions while keeping telemetry continuous (1:1).
+- **Vertical (9:16) Phone Normalization & Audio Routing**: Normalizes phone clips to project resolution, CFR, yuv420p, and SAR=1. Center vertical 9:16 clips over blurred/dimmed 16:9 background (`--phone-vertical blur`, default) or letterboxed black (`--phone-vertical black`). Route action-camera mic narration onto phone clips with `--keep-camera-audio`.
+- **20ms Audio Boundary Fades**: Applies 20ms audio fade-in/fade-out (`afade`) at clip boundaries to eliminate clicks and pops on hard cuts without changing segment durations.
+- **Silent 1× Hyperlapse Compression** (`--compress-silent`, default off): Speds up silent sections in 1× action-camera recordings by `--factor` (default 15×) using smooth frame blending (`tblend`/`setpts`) while keeping spoken commentary at 1× and the FIT telemetry clock perfectly synchronized.
 - **Outdoor panel**: time, speed, heart rate, elevation, distance + GPS minimap
 - **Dive panel** (auto when FIT has depth samples): time, depth, max depth, heart rate, temperature; plus NDL, TTS, ascent rate, CNS when present in the FIT
-- **Auto-align** video to FIT via MP4 `creation_time` (default on)
+- **Auto-align** video to FIT via Pixel UTC filename or MP4 `creation_time` (default on)
 - **Hyperlapse**: silent sections use `--factor` (default 15×); audio sections stay 1×
 - **Photos** in batch: EXIF time → FIT (local EXIF converted with display TZ offset)
 - **Mid-clip photos**: stills taken while a video was recording are inserted by splitting that clip
@@ -96,19 +100,45 @@ FIT files with depth samples switch to the dive panel automatically. Underwater 
 | `--time auto\|local\|utc` | How TIME is displayed | `auto` |
 | `--utc-offset HOURS` | Force display timezone offset | from video when possible |
 | `--no-auto-align` | Do not use MP4 creation_time vs FIT start | auto-align on |
+| `--phone-priority` / `--no-phone-priority` | Prioritize phone clips & carve overlapping camera intervals | on |
+| `--phone-vertical blur\|black` | Background for vertical (9:16) phone clips | `blur` |
+| `--keep-camera-audio` | Route action-camera audio onto overlapping phone cutaways | off |
+| `--compress-silent` | Compress silent segments in 1× action-cam footage via `tblend`/`setpts` | off |
 | `-o FILE` | Output path | `workout_overlay.mp4` / `workout_batch.mp4` |
 
 `freedive` and `scuba` both use the dive panel; extra scuba metrics (NDL, TTS, …) appear only if the FIT contains them.
+
+## Phone Video Priority & Interval Carving
+
+When filming with both an action camera (e.g. DJI Osmo on a chest mount) and a smartphone (e.g. handheld Google Pixel or iPhone cutaways):
+- **Detection**: Phone videos are detected automatically by filename prefix (`PXL_`, `IMG_`) or container metadata (`com.android.manufacturer`, `com.apple.quicktime.make`).
+- **Pixel UTC Filename Timestamps**: Google Pixel files (`PXL_YYYYMMDD_HHMMSSmmm*.mp4`) have their exact millisecond-accurate UTC start time parsed directly from the filename before falling back to container creation metadata.
+- **1× Speed Lock**: Phone videos are always locked to 1× speed, preserving natural real-time movement and speech regardless of background sound levels.
+- **Interval Carving**: On the FIT timeline, any action-camera footage overlapping a higher-priority phone clip is carved out. Leftover camera fragments shorter than 0.5 seconds are cleanly discarded.
+- **Continuous Real-Time Telemetry**: FIT telemetry advances 1:1 across phone cutaways with continuous metric tracking and GPS positioning.
+
+## Vertical (9:16) Phone Normalization & Audio Routing
+
+- **Normalization**: Phone videos (which are frequently Variable Frame Rate / VFR or 9:16 vertical) are normalized to the project's target resolution (16:9), CFR, SAR=1, and `yuv420p` pixel format to ensure glitch-free concatenation.
+- **`--phone-vertical blur` (default)**: Centers the sharp 9:16 phone video over a scaled, cropped, blurred, and slightly dimmed (-0.12 brightness) 16:9 background copy so the overlay HUD and minimap remain clear and legible.
+- **`--phone-vertical black`**: Centers the 9:16 phone video with black letterbox bars.
+- **`--keep-camera-audio`**: When enabled and a phone clip overlaps an action camera recording, the action camera's audio track (such as an external wireless microphone) is routed onto the phone video slice.
+- **Audio Fades**: A 20ms (0.02s) `afade` is applied at all segment boundaries, preventing audible clicks on cuts without shifting segment durations.
+
+## Silent 1× Hyperlapse Compression (`--compress-silent`)
+
+If your action camera was recorded in standard 1× Video mode rather than Hyperlapse mode, `--compress-silent` automatically detects audio silence and accelerates those segments by `--factor` (default 15×) using smooth frame blending (`tblend=all_mode=average,setpts=PTS/factor`). Spoken commentary segments remain at 1×, and the FIT telemetry clock stays fully synchronized.
 
 ## Alignment model
 
 | Media | How it is placed on the FIT timeline |
 |-------|--------------------------------------|
-| **Video** | MP4 `creation_time` (UTC) vs FIT start → offset (auto). Hyperlapse map from audio. |
+| **Phone Video** | Exact UTC from Pixel filename or creation metadata; locked to 1×; carves action camera intervals. |
+| **Action Cam Video** | MP4 `creation_time` (UTC) vs FIT start → offset (auto). Hyperlapse map from audio (or `--compress-silent`). |
 | **Photo** | EXIF capture time treated as **local**; converted to UTC with the same offset as `--time auto` / `--utc-offset`, then placed on the FIT timeline. |
-| **Mid-clip photo** | If photo time falls inside a video’s FIT window, that video is split and the still is inserted at that moment. |
+| **Mid-clip photo** | If photo time falls inside a carved video slice's FIT window, that slice is split and the still is inserted at that moment. |
 
-Original DJI files keep reliable timestamps. Edited/merged exports often lose `creation_time` — use a manual offset if needed.
+Original DJI and Pixel files keep reliable timestamps. Edited/merged exports often lose `creation_time` — use a manual offset if needed.
 
 ## Hyperlapse note
 
@@ -140,7 +170,7 @@ Amazfit freedive exports typically include depth, temperature, and heart rate. S
 
 ## Debug GUI
 
-Optional CustomTkinter tool for alignment / hyperlapse debugging:
+Optional CustomTkinter tool for alignment, phone priority, and hyperlapse debugging:
 
 ```bash
 pip install customtkinter   # once, in ~/dashboard-env
@@ -149,8 +179,11 @@ pip install customtkinter   # once, in ~/dashboard-env
 ```
 
 - Pick a batch folder (one `.fit` + videos/photos)
+- Media list clearly distinguishes action camera clips (`▶ [CAM]`) from phone recordings (`📱 [PHONE]`)
+- Toggle controls for **Phone Priority**, **Vertical (blur/black)**, **Keep Cam Audio**, and **Compress Silent (1×)**
 - Preview clip with scrub; see **file time**, **detected factor (1×/15×)**, **mapped FIT time**, sample telemetry
-- Segment list, auto-align note, render plan, copy debug snapshot
+- View render plan highlighting `PHONE [PRIORITY]` cuts (and `+cam_audio` when active)
+- Segment list, auto-align note, render plan modal, and copy debug snapshot to clipboard
 
 ## Project layout
 

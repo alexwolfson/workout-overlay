@@ -1,0 +1,2578 @@
+==> workout_overlay.py <==
+#!/usr/bin/env python3
+"""
+Workout Overlay
+Overlay Amazfit/Zepp FIT telemetry onto video (bike, run, dive clips).
+
+Single clip:
+  python workout_overlay.py video.mp4 activity.fit [--preview] [-o out.mp4]
+
+Batch (one FIT + MP4s and/or photos):
+  python workout_overlay.py --batch ./folder [--photo-seconds 3] [--preview] [-o out.mp4]
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import cv2
+import librosa
+import numpy as np
+from fitparse import FitFile
+from PIL import Image, ImageDraw, ImageFont, ExifTags
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".MP4", ".MOV"}
+PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG", ".webp", ".WEBP"}
+
+
+# ============================================================
+# FIT parsing
+# ============================================================
+def _rec_float(r, *names):
+    """First present numeric field among names, else nan."""
+    for name in names:
+        v = r.get(name)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return np.nan
+
+
+# FIT sport enum (common values). fitparse may return int or string.
+SPORT_ID_MAP = {
+    0: "generic", 1: "running", 2: "cycling", 5: "swimming",
+    11: "walking", 15: "rowing", 17: "hiking", 21: "e_biking",
+    53: "diving",
+}
+
+# Session sport / sub_sport strings (and id names) that use the dive panel
+DIVE_SPORT_TOKENS = {
+    "diving", "dive", "scuba", "scuba_diving", "apnea", "apnea_diving",
+    "freedive", "free_dive", "freediving", "spearfishing",
+}
+
+
+def read_session_sport(fit_path):
+    """
+    Read sport / sub_sport from the first session message.
+    Returns dict: sport, sub_sport, sport_id, sport_name (best-effort strings/ids).
+    """
+    fit = FitFile(fit_path)
+    out = {"sport": None, "sub_sport": None, "sport_id": None, "sport_name": None}
+    for session_msg in fit.get_messages("session"):
+        data = {f.name: f.value for f in session_msg}
+        sport = data.get("sport")
+        sub = data.get("sub_sport")
+        out["sport"] = sport
+        out["sub_sport"] = sub
+        if isinstance(sport, int):
+            out["sport_id"] = sport
+            out["sport_name"] = SPORT_ID_MAP.get(sport, f"id_{sport}")
+        elif sport is not None:
+            out["sport_name"] = str(sport).strip().lower()
+            # reverse lookup if string matches map values
+            for sid, name in SPORT_ID_MAP.items():
+                if name == out["sport_name"]:
+                    out["sport_id"] = sid
+                    break
+        break
+    return out
+
+
+def detect_sport(records, forced=None, fit_path=None, session=None):
+    """
+    Return panel mode: 'dive' or 'outdoor'.
+
+    Priority:
+      1. forced flag (dive|freedive|scuba|outdoor)
+      2. session sport / sub_sport from FIT (if fit_path or session given)
+      3. depth samples in records (>= 5)
+      4. outdoor
+    """
+    if forced and forced not in ("auto", None, ""):
+        if forced in ("dive", "freedive", "scuba"):
+            return "dive"
+        return "outdoor"
+
+    if session is None and fit_path:
+        try:
+            session = read_session_sport(fit_path)
+        except Exception:
+            session = None
+
+    if session:
+        tokens = []
+        for key in ("sport_name", "sport", "sub_sport"):
+            v = session.get(key)
+            if v is None:
+                continue
+            if isinstance(v, int):
+                tokens.append(SPORT_ID_MAP.get(v, str(v)).lower())
+                if v == 53:
+                    return "dive"
+            else:
+                tokens.append(str(v).strip().lower().replace(" ", "_"))
+        for t in tokens:
+            if t in DIVE_SPORT_TOKENS or "dive" in t or "scuba" in t or "apnea" in t:
+                return "dive"
+
+    n_depth = sum(1 for r in records if r.get("depth") is not None)
+    if n_depth >= 5:
+        return "dive"
+    return "outdoor"
+
+
+def parse_fit(fit_path):
+    fit = FitFile(fit_path)
+    records = []
+    for record in fit.get_messages("record"):
+        data = {f.name: f.value for f in record}
+        if "timestamp" in data:
+            records.append(data)
+
+    if not records:
+        raise ValueError("No records found in FIT file")
+
+    records.sort(key=lambda r: r["timestamp"])
+    start_time = records[0]["timestamp"]
+
+    gps_points = []
+    for r in records:
+        lat = r.get("position_lat")
+        lon = r.get("position_long")
+        if lat is not None and lon is not None:
+            lat = lat * (180.0 / 2**31)
+            lon = lon * (180.0 / 2**31)
+            gps_points.append((lat, lon, r["timestamp"]))
+
+    session = None
+    try:
+        session = read_session_sport(fit_path)
+    except Exception:
+        session = None
+
+    sport = detect_sport(records, fit_path=fit_path, session=session)
+    n_depth = sum(1 for r in records if r.get("depth") is not None)
+    n_temp = sum(1 for r in records if r.get("temperature") is not None)
+
+    print(f"FIT start     : {start_time}")
+    print(f"FIT points    : {len(records)}")
+    print(f"GPS points    : {len(gps_points)}")
+    print(f"FIT duration  : {records[-1]['timestamp'] - start_time}")
+    if session:
+        print(
+            f"Session sport : sport={session.get('sport')!r}  "
+            f"sub_sport={session.get('sub_sport')!r}  "
+            f"name={session.get('sport_name')!r}"
+        )
+    print(f"Sport detect  : {sport}  (depth samples={n_depth}, temp samples={n_temp})")
+    if sport == "dive" or n_depth >= 5:
+        immersions = detect_dive_immersions(records, start_time)
+        if immersions:
+            print(
+                f"Dive immersions: {len(immersions)}  "
+                f"(start>={DIVE_START_DEPTH_M}m end<={DIVE_END_DEPTH_M}m "
+                f"min>={DIVE_MIN_DURATION_S}s start_hold>={DIVE_START_HOLD_S}s "
+                f"end_hold>={DIVE_END_HOLD_S}s merge_gap<={DIVE_MERGE_SURFACE_GAP_S}s)"
+            )
+
+
+            for im in immersions:
+                print(
+                    f"  #{im['num']}  {im['start_s']:.1f}→{im['end_s']:.1f}s  "
+                    f"({im['end_s'] - im['start_s']:.0f}s)  max={im['max_depth']:.1f}m"
+                )
+        else:
+            print("Dive immersions: none (try lower depth threshold if Zepp shows dives)")
+    return records, start_time, gps_points
+
+
+# ============================================================
+# Time helpers
+# ============================================================
+def parse_dji_filename_local(video_path):
+    name = os.path.basename(video_path)
+    m = re.search(r"(?:DJI_)?(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", name)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = map(int, m.groups())
+    try:
+        return datetime(y, mo, d, h, mi, s)
+    except ValueError:
+        return None
+
+
+def get_mp4_creation_time_utc(video_path):
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format_tags=creation_time",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        video_path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, text=True).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if not out:
+        return None
+    out = out.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(out)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def to_utc_naive(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def video_sort_key(video_path):
+    creation = get_mp4_creation_time_utc(video_path)
+    if creation is not None:
+        return (0, creation.timestamp(), os.path.basename(video_path))
+    local = parse_dji_filename_local(video_path)
+    if local is not None:
+        return (1, local.timestamp(), os.path.basename(video_path))
+    return (2, os.path.getmtime(video_path), os.path.basename(video_path))
+
+
+def get_photo_datetime(photo_path):
+    """Best-effort photo capture time as naive datetime (camera local or UTC-ish)."""
+    try:
+        img = Image.open(photo_path)
+        exif = img._getexif() if hasattr(img, "_getexif") else None
+        if exif:
+            tag_map = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+            for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
+                raw = tag_map.get(key)
+                if raw and isinstance(raw, str):
+                    # "2026:10:07 15:01:02"
+                    try:
+                        return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    # fallback: filesystem mtime local
+    return datetime.fromtimestamp(os.path.getmtime(photo_path))
+
+
+def photo_sort_key(photo_path):
+    dt = get_photo_datetime(photo_path)
+    return (dt.timestamp(), os.path.basename(photo_path))
+
+
+def resolve_display_offset_hours(video_path, time_mode, utc_offset):
+    if utc_offset is not None:
+        return float(utc_offset), f"manual --utc-offset {utc_offset}"
+    if time_mode == "utc":
+        return 0.0, "UTC"
+    if time_mode == "local":
+        now = datetime.now().astimezone()
+        off = now.utcoffset().total_seconds() / 3600.0
+        return off, f"system local ({now.tzname()}, UTC{off:+g})"
+
+    creation_utc = get_mp4_creation_time_utc(video_path) if video_path else None
+    filename_local = parse_dji_filename_local(video_path) if video_path else None
+    if creation_utc is not None and filename_local is not None:
+        delta_sec = (filename_local - creation_utc.replace(tzinfo=None)).total_seconds()
+        while delta_sec > 14 * 3600:
+            delta_sec -= 24 * 3600
+        while delta_sec < -12 * 3600:
+            delta_sec += 24 * 3600
+        offset_h = round(delta_sec / 900.0) * 0.25
+        return offset_h, f"DJI auto (filename vs creation_time, UTC{offset_h:+g})"
+
+    now = datetime.now().astimezone()
+    off = now.utcoffset().total_seconds() / 3600.0
+    return off, f"system local fallback ({now.tzname()}, UTC{off:+g})"
+
+
+def format_display_time(ts, offset_hours):
+    if ts is None:
+        return "--:--:--"
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = ts.astimezone(timezone.utc)
+    local = ts + timedelta(hours=offset_hours)
+    return local.strftime("%H:%M:%S")
+
+
+def compute_auto_align_offset(video_path, fit_start):
+    creation_utc = get_mp4_creation_time_utc(video_path)
+    filename_local = parse_dji_filename_local(video_path)
+    video_start = None
+    source = None
+    if creation_utc is not None:
+        video_start = to_utc_naive(creation_utc)
+        source = "mp4 creation_time"
+    elif filename_local is not None:
+        video_start = filename_local
+        source = "DJI filename"
+    if video_start is None:
+        print("Auto-align: could not determine video start time")
+        return None
+    fit_utc = to_utc_naive(fit_start)
+    if fit_utc is None:
+        return None
+    offset = (video_start - fit_utc).total_seconds()
+    print("Auto-align:")
+    print(f"  video_start = {video_start}  ({source})")
+    print(f"  fit_start   = {fit_utc}")
+    print(f"  offset      = {offset:.1f} s")
+    return offset
+
+
+def photo_align_offset(photo_path, fit_start, offset_hours=0.0):
+    """Map photo capture moment into FIT timeline (seconds from FIT start).
+
+    EXIF times are treated as local wall time at the shoot location.
+    offset_hours is the same as display: local = UTC + offset_hours,
+    so UTC = local - offset_hours.
+    """
+    photo_dt = get_photo_datetime(photo_path)
+    fit_utc = to_utc_naive(fit_start)
+    # Convert EXIF local -> UTC using shoot/display offset
+    photo_utc = photo_dt - timedelta(hours=float(offset_hours))
+    real_t = (photo_utc - fit_utc).total_seconds()
+    print(f"Photo align: {os.path.basename(photo_path)}")
+    print(f"  photo_exif_local = {photo_dt}")
+    print(f"  offset_hours     = {offset_hours:+g} (local = UTC + offset)")
+    print(f"  photo_as_utc     = {photo_utc}")
+    print(f"  fit_start_utc    = {fit_utc}")
+    print(f"  real_t           = {real_t:.1f} s into FIT")
+    return real_t, photo_dt
+
+
+# ============================================================
+# Hyperlapse audio detection
+# ============================================================
+def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, factor=15.0):
+    print("Analyzing audio for hyperlapse / 1x sections...")
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_wav = tmp.name
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-vn", "-acodec", "pcm_s16le",
+            "-ar", "16000", "-ac", "1", tmp_wav,
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        y, sr = librosa.load(tmp_wav, sr=None, mono=True)
+        duration = float(librosa.get_duration(y=y, sr=sr))
+        hop = 512
+        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+        rms = np.maximum(rms, 1e-10)
+        rms_db = 20.0 * np.log10(rms)
+        p10 = float(np.percentile(rms_db, 10))
+        p50 = float(np.percentile(rms_db, 50))
+        if threshold_db is None:
+            threshold_db = p10 + 0.35 * (p50 - p10)
+        enter_silence = threshold_db - 1.5
+        leave_silence = threshold_db + 1.5
+        print(f"Audio threshold: {threshold_db:.1f} dB  | silent factor={factor:g}x")
+
+        silent_state = bool(rms_db[0] < threshold_db)
+        raw = np.zeros(len(rms_db), dtype=bool)
+        for i, val in enumerate(rms_db):
+            if silent_state:
+                if val > leave_silence:
+                    silent_state = False
+            else:
+                if val < enter_silence:
+                    silent_state = True
+            raw[i] = silent_state
+
+        win = max(3, int(0.40 * sr / hop))
+        if win % 2 == 0:
+            win += 1
+        half = win // 2
+        smoothed = raw.copy()
+        for i in range(len(raw)):
+            a = max(0, i - half)
+            b = min(len(raw), i + half + 1)
+            smoothed[i] = np.mean(raw[a:b]) >= 0.5
+
+        segments = []
+        current = bool(smoothed[0])
+        seg_start = 0.0
+        for i in range(1, len(smoothed)):
+            if bool(smoothed[i]) != current:
+                speed = factor if current else 1
+                segments.append((seg_start, float(times[i]), speed))
+                seg_start = float(times[i])
+                current = bool(smoothed[i])
+        speed = factor if current else 1
+        segments.append((seg_start, duration, speed))
+
+        cleaned = []
+        for start, end, speed in segments:
+            if cleaned and (end - start) < min_segment_s:
+                ps, pe, psp = cleaned[-1]
+                cleaned[-1] = (ps, end, psp)
+            else:
+                cleaned.append((start, end, speed))
+        if len(cleaned) >= 2 and (cleaned[0][1] - cleaned[0][0]) < min_segment_s:
+            s0, e0, sp0 = cleaned[0]
+            s1, e1, sp1 = cleaned[1]
+            cleaned[0:2] = [(s0, e1, sp1)]
+
+        print("\nDetected segments:")
+        for s, e, sp in cleaned:
+            print(f"  {s:7.1f} → {e:7.1f}s   {sp:g}x")
+        return cleaned
+    finally:
+        if os.path.exists(tmp_wav):
+            os.remove(tmp_wav)
+
+
+def build_time_map(segments):
+    boundaries = []
+    real_t = 0.0
+    for start, end, speed in segments:
+        boundaries.append((start, real_t, speed))
+        real_t += (end - start) * speed
+    boundaries.append((segments[-1][1], real_t, 1))
+
+    def video_to_real(t):
+        if t <= boundaries[0][0]:
+            return boundaries[0][1]
+        for i in range(len(boundaries) - 1):
+            v0, r0, speed = boundaries[i]
+            v1 = boundaries[i + 1][0]
+            if v0 <= t <= v1:
+                return r0 + (t - v0) * speed
+        return real_t
+
+    def real_to_video(r):
+        """Inverse map: real seconds (within clip, before extra_offset) -> file time."""
+        if r <= 0:
+            return boundaries[0][0]
+        if r >= real_t:
+            return boundaries[-1][0]
+        for i in range(len(boundaries) - 1):
+            v0, r0, speed = boundaries[i]
+            r1 = boundaries[i + 1][1]
+            if r0 <= r <= r1:
+                if speed == 0:
+                    return v0
+                return v0 + (r - r0) / speed
+        return boundaries[-1][0]
+
+    print(f"Total real-world time covered: {real_t:.1f}s\n")
+    return video_to_real, real_to_video, real_t
+
+
+# ============================================================
+# Dive immersion detection (depth timeline — Amazfit multi-dive)
+# ============================================================
+# Amazfit auto start ~1.2 m / end ~0.9 m.
+# One continuous scuba dive must not be split by brief shallow noise.
+DIVE_START_DEPTH_M = 1.2
+DIVE_END_DEPTH_M = 0.9
+DIVE_MIN_DURATION_S = 30.0          # ignore short dips
+DIVE_START_HOLD_S = 5.0             # time deeper than start threshold to begin
+DIVE_END_HOLD_S = 60.0              # must stay shallow this long to end a dive
+DIVE_MERGE_SURFACE_GAP_S = 600.0    # surface < 10 min → still same dive
+
+
+def detect_dive_immersions(
+    records,
+    start_time,
+    start_depth_m=DIVE_START_DEPTH_M,
+    end_depth_m=DIVE_END_DEPTH_M,
+    min_duration_s=DIVE_MIN_DURATION_S,
+    start_hold_s=DIVE_START_HOLD_S,
+    end_hold_s=DIVE_END_HOLD_S,
+    merge_surface_gap_s=DIVE_MERGE_SURFACE_GAP_S,
+):
+    """
+    Split a multi-dive session into immersions from the depth series.
+    Returns list of dicts: num (1-based), start_s, end_s, max_depth
+    (times are seconds from FIT start_time).
+
+    Not per-video: always the full FIT timeline.
+    Robustness for one long scuba dive:
+      - missing depth forward-filled (not treated as 0 m)
+      - start after start_hold_s deep
+      - end only after end_hold_s continuous shallow (default 60 s)
+      - merge immersions with surface gap <= merge_surface_gap_s (default 10 min)
+    """
+    times = []
+    depths_raw = []
+    for r in records:
+        t = (r["timestamp"] - start_time).total_seconds()
+        d = r.get("depth")
+        times.append(t)
+        try:
+            depths_raw.append(float(d) if d is not None else None)
+        except (TypeError, ValueError):
+            depths_raw.append(None)
+
+    if not times:
+        return []
+
+    # Forward-fill missing depth so gaps do not look like the surface
+    depths = []
+    last = 0.0
+    for d in depths_raw:
+        if d is not None and not (isinstance(d, float) and np.isnan(d)):
+            last = d
+        depths.append(last)
+
+    immersions = []
+    in_dive = False
+    seg_start = 0.0
+    max_d = 0.0
+    pending_start_t = None
+    pending_end_t = None
+
+    for t, dep in zip(times, depths):
+        if not in_dive:
+            if dep >= start_depth_m:
+                if pending_start_t is None:
+                    pending_start_t = t
+                elif t - pending_start_t >= start_hold_s:
+                    in_dive = True
+                    seg_start = pending_start_t
+                    max_d = dep
+                    pending_start_t = None
+                    pending_end_t = None
+            else:
+                pending_start_t = None
+        else:
+            if dep > max_d:
+                max_d = dep
+            if dep <= end_depth_m:
+                if pending_end_t is None:
+                    pending_end_t = t
+                elif t - pending_end_t >= end_hold_s:
+                    end_t = pending_end_t
+                    dur = end_t - seg_start
+                    if dur >= min_duration_s:
+                        immersions.append({
+                            "num": len(immersions) + 1,
+                            "start_s": seg_start,
+                            "end_s": end_t,
+                            "max_depth": max_d,
+                        })
+                    in_dive = False
+                    pending_end_t = None
+                    pending_start_t = None
+            else:
+                pending_end_t = None  # went deep again — cancel surface
+
+    if in_dive and times:
+        end_t = times[-1]
+        if end_t - seg_start >= min_duration_s:
+            immersions.append({
+                "num": len(immersions) + 1,
+                "start_s": seg_start,
+                "end_s": end_t,
+                "max_depth": max_d,
+            })
+
+    # Merge immersions separated by a short surface interval
+    if len(immersions) >= 2 and merge_surface_gap_s > 0:
+        merged = [dict(immersions[0])]
+        for im in immersions[1:]:
+            prev = merged[-1]
+            gap = im["start_s"] - prev["end_s"]
+            if gap <= merge_surface_gap_s:
+                prev["end_s"] = im["end_s"]
+                prev["max_depth"] = max(prev["max_depth"], im["max_depth"])
+            else:
+                merged.append(dict(im))
+        for i, im in enumerate(merged, 1):
+            im["num"] = i
+        immersions = merged
+
+    return immersions
+
+
+def _dive_state_at(immersions, real_t):
+    """
+    Return (dive_num, dive_time_s, dive_max_depth) at real_t.
+    While underwater: live dive time. On surface: hide dive time (nan),
+    keep last dive number for context.
+    """
+    if not immersions:
+        return np.nan, np.nan, np.nan
+    for im in immersions:
+        if im["start_s"] <= real_t <= im["end_s"]:
+            return float(im["num"]), real_t - im["start_s"], im["max_depth"]
+    last = None
+    for im in immersions:
+        if im["end_s"] < real_t:
+            last = im
+        elif im["start_s"] > real_t:
+            break
+    if last is not None:
+        return float(last["num"]), np.nan, last["max_depth"]
+    return np.nan, np.nan, np.nan
+
+
+# ============================================================
+# Precompute / lookup helpers
+# ============================================================
+def _build_record_arrays(records, start_time, immersions=None):
+    """Arrays aligned to FIT records, including dive fields and per-dive max depth."""
+    if immersions is None:
+        immersions = detect_dive_immersions(records, start_time)
+
+    rec_times = np.array([(r["timestamp"] - start_time).total_seconds() for r in records])
+    rec_speed = np.array([_rec_float(r, "speed") for r in records])
+    rec_hr = np.array([_rec_float(r, "heart_rate") for r in records])
+    rec_elev = np.array([
+        _rec_float(r, "enhanced_altitude", "altitude") for r in records
+    ])
+    rec_dist = np.array([_rec_float(r, "distance") for r in records])
+    rec_depth = np.array([_rec_float(r, "depth") for r in records])
+    rec_temp = np.array([_rec_float(r, "temperature") for r in records])
+    rec_ndl = np.array([_rec_float(r, "ndl_time", "ndl") for r in records])
+    rec_tts = np.array([_rec_float(r, "time_to_surface") for r in records])
+    rec_ascent = np.array([_rec_float(r, "ascent_rate") for r in records])
+    rec_cns = np.array([_rec_float(r, "cns_load") for r in records])
+    rec_ts = [r["timestamp"] for r in records]
+
+    n = len(records)
+    rec_max_depth = np.full(n, np.nan)
+    rec_dive_num = np.full(n, np.nan)
+    rec_dive_time = np.full(n, np.nan)
+
+    # Session running max (fallback)
+    session_running = np.nan
+    for i, d in enumerate(rec_depth):
+        if not np.isnan(d):
+            session_running = d if np.isnan(session_running) else max(session_running, d)
+        real_t = rec_times[i]
+        dnum, dtime, dmax = _dive_state_at(immersions, real_t)
+        rec_dive_num[i] = dnum
+        rec_dive_time[i] = dtime
+        # Prefer current/last dive max; else session running max
+        if dmax is not None and not (isinstance(dmax, float) and np.isnan(dmax)):
+            rec_max_depth[i] = dmax
+        else:
+            rec_max_depth[i] = session_running
+
+    return {
+        "times": rec_times,
+        "speed": rec_speed,
+        "hr": rec_hr,
+        "elev": rec_elev,
+        "dist": rec_dist,
+        "depth": rec_depth,
+        "max_depth": rec_max_depth,
+        "temp": rec_temp,
+        "ndl": rec_ndl,
+        "tts": rec_tts,
+        "ascent": rec_ascent,
+        "cns": rec_cns,
+        "dive_num": rec_dive_num,
+        "dive_time": rec_dive_time,
+        "ts": rec_ts,
+        "immersions": immersions,
+    }
+
+
+def precompute_data(records, start_time, gps_points, video_to_real, duration, extra_offset, step=0.20):
+    print("Precomputing dashboard data...")
+    times = np.arange(0, duration + step, step)
+    n = len(times)
+    arrays = {k: np.full(n, np.nan) for k in (
+        "speed", "hr", "elev", "dist", "lat", "lon",
+        "depth", "max_depth", "temp", "ndl", "tts", "ascent", "cns",
+        "dive_num", "dive_time",
+    )}
+    clock = []
+
+    rec = _build_record_arrays(records, start_time)
+    immersions = rec.get("immersions") or []
+    if immersions:
+        print(f"Dive immersions detected: {len(immersions)}")
+        for im in immersions:
+            print(
+                f"  #{im['num']}  {im['start_s']:.1f}→{im['end_s']:.1f}s  "
+                f"({im['end_s'] - im['start_s']:.0f}s)  max={im['max_depth']:.1f}m"
+            )
+    gps_times = np.array([(p[2] - start_time).total_seconds() for p in gps_points]) if gps_points else np.array([])
+    gps_lat = np.array([p[0] for p in gps_points]) if gps_points else np.array([])
+    gps_lon = np.array([p[1] for p in gps_points]) if gps_points else np.array([])
+
+    for i, t in enumerate(times):
+        real_t = video_to_real(t) + extra_offset
+        idx = int(np.argmin(np.abs(rec["times"] - real_t)))
+        for key in (
+            "speed", "hr", "elev", "dist", "depth", "max_depth", "temp",
+            "ndl", "tts", "ascent", "cns", "dive_num", "dive_time",
+        ):
+            arrays[key][i] = rec[key][idx]
+        clock.append(rec["ts"][idx])
+        if len(gps_times) > 0:
+            gidx = int(np.argmin(np.abs(gps_times - real_t)))
+            arrays["lat"][i] = gps_lat[gidx]
+            arrays["lon"][i] = gps_lon[gidx]
+
+    print(f"Precomputed {n} points\n")
+    return times, arrays, clock
+
+
+def lookup_at_real_t(records, start_time, gps_points, real_t):
+    rec = _build_record_arrays(records, start_time)
+    idx = int(np.argmin(np.abs(rec["times"] - real_t)))
+    lat = lon = np.nan
+    if gps_points:
+        gps_times = np.array([(p[2] - start_time).total_seconds() for p in gps_points])
+        gidx = int(np.argmin(np.abs(gps_times - real_t)))
+        lat, lon = gps_points[gidx][0], gps_points[gidx][1]
+    return {
+        "speed": rec["speed"][idx],
+        "hr": rec["hr"][idx],
+        "elev": rec["elev"][idx],
+        "dist": rec["dist"][idx],
+        "depth": rec["depth"][idx],
+        "max_depth": rec["max_depth"][idx],
+        "temp": rec["temp"][idx],
+        "ndl": rec["ndl"][idx],
+        "tts": rec["tts"][idx],
+        "ascent": rec["ascent"][idx],
+        "cns": rec["cns"][idx],
+        "dive_num": rec["dive_num"][idx],
+        "dive_time": rec["dive_time"][idx],
+        "lat": lat,
+        "lon": lon,
+        "ts": rec["ts"][idx],
+    }
+
+
+# ============================================================
+# Drawing
+# ============================================================
+def latlon_to_pixel(lat, lon, min_lat, max_lat, min_lon, max_lon, map_w, map_h, padding=6):
+    if max_lat == min_lat or max_lon == min_lon:
+        return map_w // 2, map_h // 2
+    x = padding + (lon - min_lon) / (max_lon - min_lon) * (map_w - 2 * padding)
+    y = padding + (1 - (lat - min_lat) / (max_lat - min_lat)) * (map_h - 2 * padding)
+    return int(x), int(y)
+
+
+def _fmt_row_value(value, fmt="auto"):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return None
+    if fmt == "int":
+        return str(int(round(value)))
+    if fmt == "time_s":
+        # NDL / TTS as mm:ss when >= 60s, else seconds
+        s = int(round(value))
+        if s >= 60:
+            return f"{s // 60}:{s % 60:02d}"
+        return str(s)
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    return str(value)
+
+
+def make_overlay_rgba_values(data, gps_points, w, h, fonts, offset_hours, sport="outdoor"):
+    """
+    data: dict with keys speed, hr, elev, dist, depth, max_depth, temp,
+          ndl, tts, ascent, cns, lat, lon, ts
+    sport: 'outdoor' | 'dive'
+    """
+    font_label, font_value, font_time = fonts
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    time_str = format_display_time(data["ts"], offset_hours)
+    lat = data.get("lat", np.nan)
+    lon = data.get("lon", np.nan)
+
+    # Build visible rows for this sport (skip missing values)
+    rows = []
+    if sport == "dive":
+        depth = data.get("depth", np.nan)
+        max_d = data.get("max_depth", np.nan)
+        hr = data.get("hr", np.nan)
+        temp = data.get("temp", np.nan)
+        ndl = data.get("ndl", np.nan)
+        tts = data.get("tts", np.nan)
+        ascent = data.get("ascent", np.nan)
+        cns = data.get("cns", np.nan)
+        dive_num = data.get("dive_num", np.nan)
+        dive_time = data.get("dive_time", np.nan)
+        if not (isinstance(dive_num, float) and np.isnan(dive_num)):
+            rows.append(("DIVE", _fmt_row_value(dive_num, "int"), "", (180, 220, 255, 255)))
+        if not (isinstance(dive_time, float) and np.isnan(dive_time)):
+            rows.append(
+                ("DIVE TIME", _fmt_row_value(dive_time, "time_s"),
+                 "min" if dive_time >= 60 else "s", (200, 230, 255, 255))
+            )
+        if not (isinstance(depth, float) and np.isnan(depth)):
+            rows.append(("DEPTH", _fmt_row_value(depth), "m", (120, 200, 255, 255)))
+        if not (isinstance(max_d, float) and np.isnan(max_d)):
+            rows.append(("MAX DEPTH", _fmt_row_value(max_d), "m", (80, 180, 255, 255)))
+        if not (isinstance(hr, float) and np.isnan(hr)):
+            rows.append(("HEART RATE", _fmt_row_value(hr, "int"), "bpm", (255, 120, 120, 255)))
+        if not (isinstance(temp, float) and np.isnan(temp)):
+            rows.append(("TEMP", _fmt_row_value(temp), "°C", (140, 255, 180, 255)))
+        if not (isinstance(ndl, float) and np.isnan(ndl)):
+            rows.append(("NDL", _fmt_row_value(ndl, "time_s"), "min" if ndl >= 60 else "s", (255, 210, 120, 255)))
+        if not (isinstance(tts, float) and np.isnan(tts)):
+            rows.append(("TTS", _fmt_row_value(tts, "time_s"), "min" if tts >= 60 else "s", (255, 180, 100, 255)))
+        if not (isinstance(ascent, float) and np.isnan(ascent)):
+            # FIT often m/s; show m/min when small
+            if abs(ascent) < 2:
+                rows.append(("ASCENT", _fmt_row_value(ascent * 60), "m/min", (200, 160, 255, 255)))
+            else:
+                rows.append(("ASCENT", _fmt_row_value(ascent), "m/s", (200, 160, 255, 255)))
+        if not (isinstance(cns, float) and np.isnan(cns)):
+            rows.append(("CNS", _fmt_row_value(cns, "int"), "%", (255, 140, 180, 255)))
+    else:
+        speed = data.get("speed", np.nan)
+        hr = data.get("hr", np.nan)
+        elev = data.get("elev", np.nan)
+        dist = data.get("dist", np.nan)
+        speed_kmh = speed * 3.6 if not (isinstance(speed, float) and np.isnan(speed)) else None
+        dist_km = dist / 1000 if not (isinstance(dist, float) and np.isnan(dist)) else None
+        rows.append(("SPEED", _fmt_row_value(speed_kmh) if speed_kmh is not None else None, "km/h", (120, 200, 255, 255)))
+        rows.append(("HEART RATE", _fmt_row_value(hr, "int") if not (isinstance(hr, float) and np.isnan(hr)) else None, "bpm", (255, 120, 120, 255)))
+        rows.append(("ELEVATION", _fmt_row_value(elev) if not (isinstance(elev, float) and np.isnan(elev)) else None, "m", (140, 255, 180, 255)))
+        rows.append(("DISTANCE", _fmt_row_value(dist_km) if dist_km is not None else None, "km", (255, 210, 120, 255)))
+
+    scale = max(1.0, w / 1920.0)
+    margin = int(24 * scale)
+    box_w = int(320 * scale)
+    # Dynamic height: TIME block + each row + padding
+    box_h = int((12 + 74 + len(rows) * 72 + 20) * scale)
+    box_h = max(box_h, int(200 * scale))
+    x0 = margin
+    y0 = h - box_h - margin
+
+    draw.rectangle([x0, y0, x0 + box_w, y0 + box_h], fill=(0, 0, 0, 185))
+    draw.rectangle([x0, y0, x0 + box_w, y0 + box_h], outline=(255, 255, 255, 45), width=1)
+
+    y = y0 + int(12 * scale)
+
+    def row(label, value, unit="", accent=(120, 200, 255, 255)):
+        nonlocal y
+        val = value if value is not None else "--"
+        draw.text((x0 + int(18 * scale), y), label, font=font_label, fill=accent)
+        draw.text(
+            (x0 + int(18 * scale), y + int(16 * scale)),
+            f"{val} {unit}".strip() if value is not None else "--",
+            font=font_value,
+            fill=(255, 255, 255, 255),
+        )
+        y += int(72 * scale)
+
+    draw.text((x0 + int(18 * scale), y), "TIME", font=font_label, fill=(220, 220, 220, 255))
+    draw.text(
+        (x0 + int(18 * scale), y + int(16 * scale)),
+        time_str,
+        font=font_time,
+        fill=(255, 255, 255, 255),
+    )
+    y += int(74 * scale)
+
+    for label, value, unit, accent in rows:
+        row(label, value, unit, accent)
+
+    if len(gps_points) >= 2:
+        map_w = int(280 * scale)
+        map_h = int(200 * scale)
+        mx = w - map_w - margin
+        my = h - map_h - margin
+        draw.rectangle([mx, my, mx + map_w, my + map_h], fill=(0, 0, 0, 170))
+        draw.rectangle([mx, my, mx + map_w, my + map_h], outline=(255, 255, 255, 45), width=1)
+        lats_all = [p[0] for p in gps_points]
+        lons_all = [p[1] for p in gps_points]
+        min_lat, max_lat = min(lats_all), max(lats_all)
+        min_lon, max_lon = min(lons_all), max(lons_all)
+        points = []
+        for glat, glon, _ in gps_points:
+            px, py = latlon_to_pixel(glat, glon, min_lat, max_lat, min_lon, max_lon, map_w, map_h)
+            points.append((mx + px, my + py))
+        if len(points) >= 2:
+            draw.line(points, fill=(0, 200, 255, 220), width=max(2, int(3 * scale)))
+        if not np.isnan(lat) and not np.isnan(lon):
+            cx, cy = latlon_to_pixel(lat, lon, min_lat, max_lat, min_lon, max_lon, map_w, map_h)
+            r = max(5, int(6 * scale))
+            draw.ellipse(
+                [mx + cx - r, my + cy - r, mx + cx + r, my + cy + r],
+                fill=(255, 50, 50, 255),
+            )
+
+    rgba = np.array(img)
+    return cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA)
+
+
+def make_overlay_rgba(idx, arrays, clock, gps_points, w, h, fonts, offset_hours, sport="outdoor"):
+    data = {
+        "speed": arrays["speed"][idx],
+        "hr": arrays["hr"][idx],
+        "elev": arrays["elev"][idx],
+        "dist": arrays["dist"][idx],
+        "depth": arrays["depth"][idx],
+        "max_depth": arrays["max_depth"][idx],
+        "temp": arrays["temp"][idx],
+        "ndl": arrays["ndl"][idx],
+        "tts": arrays["tts"][idx],
+        "ascent": arrays["ascent"][idx],
+        "cns": arrays["cns"][idx],
+        "dive_num": arrays["dive_num"][idx] if "dive_num" in arrays else np.nan,
+        "dive_time": arrays["dive_time"][idx] if "dive_time" in arrays else np.nan,
+        "lat": arrays["lat"][idx],
+        "lon": arrays["lon"][idx],
+        "ts": clock[idx],
+    }
+    return make_overlay_rgba_values(
+        data, gps_points, w, h, fonts, offset_hours, sport=sport,
+    )
+
+
+def alpha_blend(base_bgr, overlay_bgra):
+    alpha = overlay_bgra[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_rgb = overlay_bgra[:, :, :3].astype(np.float32)
+    base = base_bgr.astype(np.float32)
+    return (base * (1.0 - alpha) + overlay_rgb * alpha).astype(np.uint8)
+
+
+def load_fonts(out_w):
+    try:
+        font_label = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            max(16, int(18 * out_w / 1920)),
+        )
+        font_value = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            max(28, int(34 * out_w / 1920)),
+        )
+        font_time = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            max(30, int(36 * out_w / 1920)),
+        )
+    except Exception:
+        font_label = ImageFont.load_default()
+        font_value = font_label
+        font_time = font_label
+    return font_label, font_value, font_time
+
+
+def fit_image_to_canvas(photo_path, out_w, out_h):
+    """Letterbox photo onto BGR canvas."""
+    img = Image.open(photo_path).convert("RGB")
+    # honor EXIF orientation
+    try:
+        img = ImageOps_exif_transpose(img)
+    except Exception:
+        pass
+    iw, ih = img.size
+    scale = min(out_w / iw, out_h / ih)
+    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (out_w, out_h), (0, 0, 0))
+    canvas.paste(img, ((out_w - nw) // 2, (out_h - nh) // 2))
+    rgb = np.array(canvas)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def ImageOps_exif_transpose(img):
+    from PIL import ImageOps
+    return ImageOps.exif_transpose(img)
+
+
+# ============================================================
+# Single video overlay
+# ============================================================
+def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
+                   step=0.20, preview=False, time_mode="auto", utc_offset=None,
+                   auto_align=True, offset_explicit=False,
+                   records=None, start_time=None, gps_points=None,
+                   factor=15.0, file_t_start=0.0, file_t_end=None,
+                   segments=None, fixed_offset=None, sport=None):
+    """Render overlay for a full video or a [file_t_start, file_t_end) slice."""
+    if records is None or start_time is None or gps_points is None:
+        records, start_time, gps_points = parse_fit(fit_path)
+    sport = detect_sport(records, forced=sport, fit_path=fit_path)
+    print(f"Panel sport   : {sport}")
+
+    if segments is None:
+        segments = detect_speed_segments(video_path, factor=factor)
+    video_to_real, real_to_video, _total_real = build_time_map(segments)
+
+    if fixed_offset is not None:
+        extra_offset = float(fixed_offset)
+        print(f"Alignment     : fixed offset {extra_offset:.1f} s")
+    elif offset_explicit:
+        print(f"Alignment     : manual offset {extra_offset:.1f} s")
+    elif auto_align:
+        auto = compute_auto_align_offset(video_path, start_time)
+        extra_offset = auto if auto is not None else 0.0
+        if auto is None:
+            print("Alignment     : auto-align failed, using 0")
+    else:
+        print(f"Alignment     : auto-align disabled, offset {extra_offset:.1f} s")
+
+    offset_hours, offset_desc = resolve_display_offset_hours(video_path, time_mode, utc_offset)
+    print(f"Display time   : {offset_desc}")
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = frame_count / fps if fps > 0 else 0
+
+    t0 = max(0.0, float(file_t_start or 0.0))
+    t1 = float(file_t_end) if file_t_end is not None else duration
+    t1 = min(duration, t1)
+    if t1 <= t0 + 0.05:
+        raise RuntimeError(f"Empty video slice {t0:.2f}-{t1:.2f}s in {video_path}")
+
+    if preview:
+        out_h = 1080
+        out_w = int(src_w * (out_h / src_h))
+        if out_w % 2:
+            out_w += 1
+        print(f"Preview mode: scaling {src_w}x{src_h} → {out_w}x{out_h}")
+    else:
+        out_w, out_h = src_w, src_h
+
+    slice_note = ""
+    if t0 > 0.01 or t1 < duration - 0.01:
+        slice_note = f" | slice {t0:.2f}-{t1:.2f}s"
+    print(f"Video: {duration:.1f}s | src {src_w}x{src_h} | out {out_w}x{out_h} | {fps:.3f} fps{slice_note}")
+
+    times, arrays, clock = precompute_data(
+        records, start_time, gps_points, video_to_real,
+        duration, extra_offset, step=step,
+    )
+    fonts = load_fonts(out_w)
+
+    tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    writer = cv2.VideoWriter(tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
+    if not writer.isOpened():
+        raise RuntimeError("Could not open VideoWriter")
+
+    cache = {}
+    print("Rendering frames...")
+    # Seek near start of slice
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(t0 * fps) - 1))
+    # Drain until we reach t0
+    while True:
+        pos = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        if pos >= t0 * fps - 0.5:
+            break
+        ok, _ = cap.read()
+        if not ok:
+            break
+
+    frames_written = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+        t = frame_idx / fps if fps > 0 else 0.0
+        if t < t0 - 1.0 / max(fps, 1):
+            continue
+        if t >= t1:
+            break
+
+        if preview and (frame.shape[1] != out_w or frame.shape[0] != out_h):
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+        idx = int(round(t / step))
+        idx = max(0, min(idx, len(times) - 1))
+        if idx not in cache:
+            cache[idx] = make_overlay_rgba(
+                idx, arrays, clock,
+                gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
+            )
+        writer.write(alpha_blend(frame, cache[idx]))
+        frames_written += 1
+        if frames_written % 300 == 0:
+            print(f"  slice frames {frames_written} (t≈{t:.1f}s)")
+
+    cap.release()
+    writer.release()
+    if frames_written == 0:
+        os.remove(tmp_video)
+        raise RuntimeError(f"No frames written for slice {t0}-{t1} of {video_path}")
+
+    print("Muxing audio with ffmpeg...")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", tmp_video,
+        "-ss", f"{t0:.6f}",
+        "-to", f"{t1:.6f}",
+        "-i", video_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
+    os.remove(tmp_video)
+    print(f"\nDone clip → {output_path}")
+    return output_path
+
+
+
+def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
+                      out_w, out_h, fps, photo_seconds, time_mode, utc_offset,
+                      ref_video_for_tz=None, sport=None):
+    # Resolve timezone first so EXIF local can be converted to UTC for FIT lookup
+    offset_hours, offset_desc = resolve_display_offset_hours(
+        ref_video_for_tz, time_mode, utc_offset
+    )
+    print(f"Display time   : {offset_desc}")
+    sport = detect_sport(records, forced=sport, fit_path=None)
+
+    real_t, photo_dt = photo_align_offset(photo_path, start_time, offset_hours=offset_hours)
+    data = lookup_at_real_t(records, start_time, gps_points, real_t)
+
+    fonts = load_fonts(out_w)
+    base = fit_image_to_canvas(photo_path, out_w, out_h)
+    overlay = make_overlay_rgba_values(
+        data, gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
+    )
+    frame = alpha_blend(base, overlay)
+
+    n_frames = max(1, int(round(photo_seconds * fps)))
+    tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+    writer = cv2.VideoWriter(tmp_video, cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
+    if not writer.isOpened():
+        raise RuntimeError("Could not open VideoWriter for photo")
+    for _ in range(n_frames):
+        writer.write(frame)
+    writer.release()
+
+    # silent audio track so concat with video clips is happier
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", tmp_video,
+        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-shortest",
+        output_path,
+    ]
+    subprocess.run(cmd, check=True)
+    os.remove(tmp_video)
+    print(f"Done photo → {output_path} ({photo_seconds}s @ {photo_dt})")
+    return output_path
+
+
+# ============================================================
+# Batch
+# ============================================================
+def discover_batch(folder):
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise RuntimeError(f"Not a directory: {folder}")
+
+    fits = list({p.resolve(): p for p in list(folder.glob("*.fit")) + list(folder.glob("*.FIT"))}.values())
+    videos = [p for p in folder.iterdir() if p.is_file() and p.suffix in VIDEO_EXTS]
+    photos = [p for p in folder.iterdir() if p.is_file() and p.suffix in PHOTO_EXTS]
+
+    if len(fits) == 0:
+        raise RuntimeError(f"No .fit file found in {folder}")
+    if len(fits) > 1:
+        names = ", ".join(f.name for f in fits)
+        raise RuntimeError(f"Multiple .fit files found ({names}). Keep exactly one.")
+    if not videos and not photos:
+        raise RuntimeError(f"No videos or photos found in {folder}")
+
+    videos_sorted = sorted((str(v) for v in videos), key=video_sort_key)
+    photos_sorted = sorted((str(p) for p in photos), key=photo_sort_key)
+    fit_path = str(fits[0])
+
+    print(f"Batch folder  : {folder}")
+    print(f"FIT           : {fits[0].name}")
+    print(f"Videos ({len(videos_sorted)}):")
+    for i, v in enumerate(videos_sorted, 1):
+        creation = get_mp4_creation_time_utc(v)
+        cstr = creation.isoformat() if creation else "no creation_time"
+        print(f"  {i}. {os.path.basename(v)}  [{cstr}]")
+    print(f"Photos ({len(photos_sorted)}):")
+    for i, ph in enumerate(photos_sorted, 1):
+        print(f"  {i}. {os.path.basename(ph)}  [{get_photo_datetime(ph)}]")
+    print()
+    return fit_path, videos_sorted, photos_sorted
+
+
+def media_timeline(videos, photos):
+    """Build sorted list of (sort_ts, kind, path)."""
+    items = []
+    for v in videos:
+        creation = get_mp4_creation_time_utc(v)
+        if creation is not None:
+            ts = creation.timestamp()
+        else:
+            local = parse_dji_filename_local(v)
+            ts = local.timestamp() if local else os.path.getmtime(v)
+        items.append((ts, "video", v))
+    for ph in photos:
+        dt = get_photo_datetime(ph)
+        items.append((dt.timestamp(), "photo", ph))
+    items.sort(key=lambda x: (x[0], x[1], x[2]))
+    return items
+
+
+def get_media_duration(path):
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        path,
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    return float(out)
+
+
+def get_video_size_fps(path):
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-of", "csv=p=0",
+        path,
+    ]
+    out = subprocess.check_output(cmd, text=True).strip()
+    parts = out.split(",")
+    w, h = int(parts[0]), int(parts[1])
+    num, den = parts[2].split("/")
+    fps = float(num) / float(den) if float(den) else 30.0
+    return w, h, fps
+
+
+def _prepare_clip_fade_black(src, dst, width, height, fps, fade_in, fade_out):
+    """
+    Normalize clip; add EXTRA freeze pads and fade through black.
+    fade_in/fade_out are seconds of extra time (content length unchanged).
+    """
+    dur = get_media_duration(src)
+    vf = [
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2",
+        f"fps={fps}",
+        "format=yuv420p",
+    ]
+    # Extra freeze at ends, then fade those freezes to/from black
+    if fade_in > 0:
+        vf.append(f"tpad=start_mode=clone:start_duration={fade_in:.6f}")
+    if fade_out > 0:
+        vf.append(f"tpad=stop_mode=clone:stop_duration={fade_out:.6f}")
+    if fade_in > 0:
+        vf.append(f"fade=t=in:st=0:d={fade_in:.6f}")
+    if fade_out > 0:
+        # original content ends at fade_in+dur; fade out covers the end pad
+        st = fade_in + dur
+        vf.append(f"fade=t=out:st={st:.6f}:d={fade_out:.6f}")
+    vf_str = ",".join(vf)
+
+    af_parts = []
+    if fade_in > 0:
+        ms = int(round(fade_in * 1000))
+        af_parts.append(f"adelay={ms}|{ms}:all=1")
+        af_parts.append(f"afade=t=in:st=0:d={fade_in:.6f}")
+    if fade_out > 0:
+        af_parts.append(f"apad=pad_dur={fade_out:.6f}")
+        st = fade_in + dur
+        af_parts.append(f"afade=t=out:st={st:.6f}:d={fade_out:.6f}")
+    af_str = ",".join(af_parts) if af_parts else "anull"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", src,
+        "-vf", vf_str,
+        "-af", af_str,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-ar", "48000",
+        "-ac", "2",
+        dst,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def concat_videos(video_paths, output_path, transition_seconds=0.0):
+    """Concatenate clips.
+    transition_seconds > 0: fade to black then from black as EXTRA time
+    (no hard cuts, content length preserved).
+    """
+    if len(video_paths) == 1:
+        cmd = ["ffmpeg", "-y", "-i", video_paths[0], "-c", "copy", output_path]
+        subprocess.run(cmd, check=True)
+        print(f"\nDone batch → {output_path}")
+        return
+
+    transition_seconds = float(transition_seconds or 0.0)
+    if transition_seconds <= 0:
+        list_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        try:
+            for vp in video_paths:
+                safe = os.path.abspath(vp).replace("'", "'\\''")
+                list_file.write("file '" + safe + "'\n")
+            list_file.close()
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file.name,
+                "-c", "copy",
+                output_path,
+            ]
+            print("Concatenating clips (hard cuts, no transition)...")
+            subprocess.run(cmd, check=True)
+            print(f"\nDone batch → {output_path}")
+        finally:
+            if os.path.exists(list_file.name):
+                os.remove(list_file.name)
+        return
+
+    # Half fade out, half fade in; total extra time per gap = transition_seconds
+    half = transition_seconds / 2.0
+    if half < 0.05:
+        half = transition_seconds  # very short: all on fade out/in minimum
+
+    width, height, fps = get_video_size_fps(video_paths[0])
+    if abs(fps - 29.97) < 0.05 or abs(fps - 59.94) < 0.05:
+        fps = 30.0
+    else:
+        fps = max(1.0, round(fps, 3))
+
+    print(f"Transition normalize: {width}x{height} @ {fps:g} fps")
+    print(f"Fade through black: {transition_seconds:g}s extra per gap "
+          f"({half:g}s out + {half:g}s in)")
+
+    tmp_dir = tempfile.mkdtemp(prefix="fade_black_")
+    prepared = []
+    try:
+        n = len(video_paths)
+        for i, vp in enumerate(video_paths):
+            fade_in = half if i > 0 else 0.0
+            fade_out = half if i < n - 1 else 0.0
+            dst = os.path.join(tmp_dir, f"fade_{i:03d}.mp4")
+            _prepare_clip_fade_black(vp, dst, width, height, fps, fade_in, fade_out)
+            prepared.append(dst)
+
+        list_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        try:
+            for vp in prepared:
+                safe = os.path.abspath(vp).replace("'", "'\\''")
+                list_file.write("file '" + safe + "'\n")
+            list_file.close()
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", list_file.name,
+                "-c", "copy",
+                output_path,
+            ]
+            print("Concatenating faded clips...")
+            subprocess.run(cmd, check=True)
+            print(f"\nDone batch → {output_path}")
+        finally:
+            if os.path.exists(list_file.name):
+                os.remove(list_file.name)
+    finally:
+        for pth in prepared:
+            if os.path.exists(pth):
+                os.remove(pth)
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+
+def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
+                     extra_offset, auto_align, offset_explicit, factor,
+                     time_mode, utc_offset):
+    """
+    Build ordered render plan: video slices and photos.
+    Photos whose time falls inside a video are inserted mid-clip (split video).
+    """
+    ref_video = videos[0] if videos else None
+    offset_hours, offset_desc = resolve_display_offset_hours(ref_video, time_mode, utc_offset)
+    print(f"Batch display TZ: {offset_desc}")
+
+    # Photo real_t into FIT
+    photo_meta = []
+    for ph in photos:
+        real_t, pdt = photo_align_offset(ph, start_time, offset_hours=offset_hours)
+        photo_meta.append({"path": ph, "real_t": real_t, "dt": pdt})
+    photo_meta.sort(key=lambda p: p["real_t"])
+
+    used = set()
+    plan = []  # list of {"kind", "path", ... "sort_key"}
+
+    for vpath in videos:
+        print("=" * 60)
+        print(f"Planning splits for: {os.path.basename(vpath)}")
+        print("=" * 60)
+        segments = detect_speed_segments(vpath, factor=factor)
+        video_to_real, real_to_video, total_real = build_time_map(segments)
+
+        if offset_explicit:
+            align = float(extra_offset)
+        elif auto_align:
+            auto = compute_auto_align_offset(vpath, start_time)
+            align = auto if auto is not None else 0.0
+        else:
+            align = float(extra_offset)
+
+        cap = cv2.VideoCapture(vpath)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = frame_count / fps if fps > 0 else 0.0
+        cap.release()
+
+        v_real0 = align + video_to_real(0.0)
+        v_real1 = align + video_to_real(duration)
+
+        inside = [
+            p for p in photo_meta
+            if p["path"] not in used and v_real0 < p["real_t"] < v_real1
+        ]
+        inside.sort(key=lambda p: p["real_t"])
+
+        # Build cut list: file times with optional photos at each cut (except 0)
+        cuts = [0.0]
+        photos_after_cut = {}  # file_t -> [photo, ...]
+        for p in inside:
+            vt = real_to_video(p["real_t"] - align)
+            vt = max(0.0, min(duration, float(vt)))
+            # quantize slightly to merge near-duplicates
+            key = round(vt, 2)
+            cuts.append(key)
+            photos_after_cut.setdefault(key, []).append(p)
+            used.add(p["path"])
+        cuts.append(round(duration, 3))
+        cuts = sorted(set(cuts))
+
+        print(f"  file duration {duration:.2f}s | real window {v_real0:.1f}..{v_real1:.1f}s into FIT")
+        print(f"  mid-clip photos: {len(inside)} | split points: {cuts}")
+
+        for i in range(len(cuts) - 1):
+            a, b = cuts[i], cuts[i + 1]
+            if b - a >= 0.08:
+                sort_key = align + video_to_real(a)
+                plan.append({
+                    "kind": "video_slice",
+                    "path": vpath,
+                    "t0": a,
+                    "t1": b,
+                    "align": align,
+                    "segments": segments,
+                    "sort_key": sort_key,
+                })
+            # photos at cut b (start of next piece / end of this)
+            for p in photos_after_cut.get(cuts[i + 1], []):
+                plan.append({
+                    "kind": "photo",
+                    "path": p["path"],
+                    "sort_key": p["real_t"],
+                })
+
+    # Photos not inside any video: place by real_t
+    for p in photo_meta:
+        if p["path"] not in used:
+            plan.append({
+                "kind": "photo",
+                "path": p["path"],
+                "sort_key": p["real_t"],
+            })
+            used.add(p["path"])
+
+    # On equal sort_key, put photo before the video_slice that starts at the same real time
+    # so mid-clip photos land between the two slices instead of after the remaining video.
+    plan.sort(key=lambda e: (e["sort_key"], 0 if e["kind"] == "photo" else 1, e["path"]))
+
+    print("\nFinal render plan:")
+    for i, e in enumerate(plan, 1):
+        if e["kind"] == "video_slice":
+            print(f"  {i}. [video] {os.path.basename(e['path'])}  {e['t0']:.2f}-{e['t1']:.2f}s")
+        else:
+            print(f"  {i}. [photo] {os.path.basename(e['path'])}")
+    print()
+    return plan, offset_hours
+
+
+def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
+              time_mode="auto", utc_offset=None, auto_align=True, offset_explicit=False,
+              factor=15.0, photo_seconds=3.0, transition_seconds=0.0, sport=None):
+    fit_path, videos, photos = discover_batch(folder)
+    records, start_time, gps_points = parse_fit(fit_path)
+    sport = detect_sport(records, forced=sport, fit_path=fit_path)
+    print(f"Panel sport   : {sport}")
+
+    plan, _offset_hours = build_batch_plan(
+        videos, photos, fit_path, records, start_time, gps_points,
+        extra_offset, auto_align, offset_explicit, factor,
+        time_mode, utc_offset,
+    )
+    if not plan:
+        raise RuntimeError("Batch plan is empty")
+
+    # Output size from first video slice or default
+    first_video = next((e["path"] for e in plan if e["kind"] == "video_slice"), None)
+    if first_video:
+        cap = cv2.VideoCapture(first_video)
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        if preview:
+            out_h = 1080
+            out_w = int(src_w * (out_h / src_h))
+            if out_w % 2:
+                out_w += 1
+        else:
+            out_w, out_h = src_w, src_h
+    else:
+        out_w, out_h, fps = 1920, 1080, 30.0
+
+    ref_video = videos[0] if videos else None
+    tmp_dir = tempfile.mkdtemp(prefix="overlay_batch_")
+    clip_outputs = []
+
+    try:
+        for i, e in enumerate(plan, 1):
+            print("=" * 60)
+            if e["kind"] == "video_slice":
+                print(f"Batch item {i}/{len(plan)}: [video] {os.path.basename(e['path'])} "
+                      f"{e['t0']:.2f}-{e['t1']:.2f}s")
+            else:
+                print(f"Batch item {i}/{len(plan)}: [photo] {os.path.basename(e['path'])}")
+            print("=" * 60)
+            out_clip = os.path.join(tmp_dir, f"clip_{i:03d}.mp4")
+
+            if e["kind"] == "video_slice":
+                create_overlay(
+                    e["path"], fit_path, output_path=out_clip,
+                    extra_offset=extra_offset, step=step, preview=preview,
+                    time_mode=time_mode, utc_offset=utc_offset,
+                    auto_align=False, offset_explicit=False,
+                    records=records, start_time=start_time, gps_points=gps_points,
+                    factor=factor,
+                    file_t_start=e["t0"], file_t_end=e["t1"],
+                    segments=e["segments"], fixed_offset=e["align"],
+                    sport=sport,
+                )
+            else:
+                create_photo_clip(
+                    e["path"], out_clip, records, start_time, gps_points,
+                    out_w, out_h, fps, photo_seconds, time_mode, utc_offset,
+                    ref_video_for_tz=ref_video, sport=sport,
+                )
+            clip_outputs.append(out_clip)
+
+        if len(clip_outputs) == 1:
+            cmd = ["ffmpeg", "-y", "-i", clip_outputs[0], "-c", "copy", output_path]
+            subprocess.run(cmd, check=True)
+            print(f"\nDone batch → {output_path}")
+        else:
+            concat_videos(clip_outputs, output_path, transition_seconds=transition_seconds)
+    finally:
+        for p in clip_outputs:
+            if os.path.exists(p):
+                os.remove(p)
+        try:
+            os.rmdir(tmp_dir)
+        except OSError:
+            pass
+
+
+
+def main():
+    p = argparse.ArgumentParser(description="Overlay FIT workout data onto video")
+    p.add_argument("video", nargs="?", help="Input MP4 (single-clip mode)")
+    p.add_argument("fit", nargs="?", help="Input FIT file (single-clip mode)")
+    p.add_argument("offset", nargs="?", type=float, default=None,
+                   help="Manual alignment offset seconds (overrides auto-align)")
+    p.add_argument("--batch", metavar="DIR", help="Folder with one .fit and MP4s/photos")
+    p.add_argument("-o", "--output", default=None, help="Output MP4")
+    p.add_argument("--preview", action="store_true", help="Render at 1080p for speed")
+    p.add_argument("--step", type=float, default=0.20, help="Overlay update step seconds")
+    p.add_argument("--time", choices=("auto", "local", "utc"), default="auto",
+                   help="Time display mode")
+    p.add_argument("--utc-offset", type=float, default=None,
+                   help="Manual UTC offset hours for display")
+    p.add_argument("--auto-align", dest="auto_align", action="store_true", default=True)
+    p.add_argument("--no-auto-align", dest="auto_align", action="store_false")
+    p.add_argument("--factor", type=float, default=15.0,
+                   help="Hyperlapse factor for silent sections (default: 15)")
+    p.add_argument("--photo-seconds", type=float, default=3.0,
+                   help="Seconds to show each photo in batch mode (default: 3)")
+    p.add_argument("--transition-seconds", type=float, default=0.0,
+                   help="Fade through black between clips (extra seconds, 0=hard cut, e.g. 2)")
+    p.add_argument("--sport", choices=("auto", "outdoor", "dive", "freedive", "scuba"),
+                   default="auto",
+                   help="Panel field set: auto detects dive from FIT depth samples")
+    args = p.parse_args()
+
+    offset_explicit = args.offset is not None
+    extra_offset = 0.0 if args.offset is None else args.offset
+    sport = None if args.sport == "auto" else args.sport
+
+    if args.batch:
+        output = args.output or "workout_batch.mp4"
+        run_batch(
+            args.batch, output_path=output,
+            extra_offset=extra_offset, step=args.step, preview=args.preview,
+            time_mode=args.time, utc_offset=args.utc_offset,
+            auto_align=args.auto_align, offset_explicit=offset_explicit,
+            factor=args.factor, photo_seconds=args.photo_seconds,
+            transition_seconds=args.transition_seconds, sport=sport,
+        )
+        return
+
+    if not args.video or not args.fit:
+        p.error("single-clip mode requires video and fit, or use --batch DIR")
+
+    output = args.output or "workout_overlay.mp4"
+    create_overlay(
+        args.video, args.fit, output_path=output,
+        extra_offset=extra_offset, step=args.step, preview=args.preview,
+        time_mode=args.time, utc_offset=args.utc_offset,
+        auto_align=args.auto_align, offset_explicit=offset_explicit,
+        factor=args.factor, sport=sport,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+==> debug_gui.py <==
+#!/usr/bin/env python3
+"""
+Debug GUI for Workout Overlay (CustomTkinter + OpenCV).
+
+  python debug_gui.py
+  python debug_gui.py /path/to/batch_folder
+
+Shows folder media, hyperlapse segments, align offset, and a small preview
+with file time, detected factor (1x/15x), mapped FIT time, and sample values.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+try:
+    import customtkinter as ctk
+except ImportError:
+    print("Install CustomTkinter:  pip install customtkinter")
+    sys.exit(1)
+
+import workout_overlay as wo
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def factor_at(segments, t: float) -> float:
+    if not segments:
+        return 1.0
+    for start, end, speed in segments:
+        if start <= t < end or (t == end and end == segments[-1][1]):
+            return float(speed)
+    if t <= segments[0][0]:
+        return float(segments[0][2])
+    return float(segments[-1][2])
+
+
+def fmt_hms(seconds: float | None) -> str:
+    if seconds is None or (isinstance(seconds, float) and np.isnan(seconds)):
+        return "--"
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{sec:02d}"
+    return f"{m:02d}:{sec:02d}"
+
+
+def fmt_ts(ts) -> str:
+    if ts is None:
+        return "--"
+    if isinstance(ts, datetime):
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    return str(ts)
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+class DebugApp(ctk.CTk):
+    PREVIEW_W = 640
+    PREVIEW_H = 360
+
+    def __init__(self, initial_folder: str | None = None):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.title("Workout Overlay — Debug")
+        self.geometry("1100x780")
+        self.minsize(900, 640)
+
+        # State
+        self.folder: str | None = None
+        self.fit_path: str | None = None
+        self.videos: list[str] = []
+        self.photos: list[str] = []
+        self.records = None
+        self.start_time = None
+        self.gps_points = None
+        self.sport = "outdoor"
+        self.factor = 15.0
+        self.manual_offset = 0.0
+
+        self.current_path: str | None = None
+        self.kind = "video"  # video | photo
+        self.segments: list = []
+        self.video_to_real = None
+        self.align_offset = 0.0
+        self.align_note = ""
+        self.threshold_db: float | None = None
+
+        self.cap: cv2.VideoCapture | None = None
+        self.fps = 30.0
+        self.duration = 0.0
+        self.playing = False
+        self.play_job = None
+        self._photo_image = None  # keep ref
+        self._ffplay_proc: subprocess.Popen | None = None
+
+        self._build_ui()
+        if initial_folder and os.path.isdir(initial_folder):
+            self.after(100, lambda: self.load_folder(initial_folder))
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        top = ctk.CTkFrame(self)
+        top.pack(fill="x", padx=10, pady=8)
+
+        ctk.CTkButton(top, text="Pick folder…", width=120, command=self.pick_folder).pack(
+            side="left", padx=(0, 8)
+        )
+        self.folder_label = ctk.CTkLabel(top, text="No folder", anchor="w")
+        self.folder_label.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkLabel(top, text="Factor").pack(side="left", padx=(12, 4))
+        self.factor_var = ctk.StringVar(value="15")
+        self.factor_menu = ctk.CTkOptionMenu(
+            top, variable=self.factor_var, values=["1", "5", "10", "15", "30"],
+            width=70, command=self.on_factor_change,
+        )
+        self.factor_menu.pack(side="left")
+
+        ctk.CTkLabel(top, text="Sport").pack(side="left", padx=(12, 4))
+        self.sport_var = ctk.StringVar(value="auto")
+        self.sport_menu = ctk.CTkOptionMenu(
+            top, variable=self.sport_var,
+            values=["auto", "outdoor", "dive", "freedive", "scuba"],
+            width=100, command=self.on_sport_change,
+        )
+        self.sport_menu.pack(side="left", padx=(0, 8))
+
+        body = ctk.CTkFrame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        # Left: media list
+        left = ctk.CTkFrame(body, width=260)
+        left.pack(side="left", fill="y", padx=(0, 8))
+        left.pack_propagate(False)
+        ctk.CTkLabel(left, text="Media", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(8, 4)
+        )
+        self.media_list = ctk.CTkScrollableFrame(left, width=240)
+        self.media_list.pack(fill="both", expand=True, padx=4, pady=4)
+        self._media_buttons: list = []
+
+        # Center: preview + transport
+        center = ctk.CTkFrame(body)
+        center.pack(side="left", fill="both", expand=True)
+
+        self.preview_label = ctk.CTkLabel(
+            center, text="No clip", width=self.PREVIEW_W, height=self.PREVIEW_H
+        )
+        self.preview_label.pack(padx=8, pady=8)
+
+        transport = ctk.CTkFrame(center)
+        transport.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(transport, text="▶", width=40, command=self.toggle_play).pack(
+            side="left", padx=2
+        )
+        ctk.CTkButton(transport, text="⏹", width=40, command=self.stop_play).pack(
+            side="left", padx=2
+        )
+        self.scrub = ctk.CTkSlider(
+            transport, from_=0, to=1, number_of_steps=1000, command=self.on_scrub
+        )
+        self.scrub.pack(side="left", fill="x", expand=True, padx=8)
+        self.time_label = ctk.CTkLabel(transport, text="00:00 / 00:00", width=110)
+        self.time_label.pack(side="left")
+
+        # Debug readout
+        info = ctk.CTkFrame(center)
+        info.pack(fill="x", padx=8, pady=4)
+        self.info_vars = {
+            "file_t": ctk.StringVar(value="File time: --"),
+            "factor": ctk.StringVar(value="Factor: --"),
+            "real_t": ctk.StringVar(value="Real (FIT) t: --"),
+            "fit_clock": ctk.StringVar(value="FIT clock: --"),
+            "movie_t": ctk.StringVar(value="Movie time: --"),
+            "align": ctk.StringVar(value="Align: --"),
+            "sample": ctk.StringVar(value="Sample: --"),
+            "sport": ctk.StringVar(value="Sport: --"),
+        }
+        for key in (
+            "file_t", "factor", "real_t", "fit_clock", "movie_t",
+            "align", "sample", "sport",
+        ):
+            ctk.CTkLabel(info, textvariable=self.info_vars[key], anchor="w").pack(
+                fill="x", padx=6, pady=1
+            )
+
+        btns = ctk.CTkFrame(center)
+        btns.pack(fill="x", padx=8, pady=6)
+        ctk.CTkButton(btns, text="Re-analyze segments", command=self.reanalyze).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(btns, text="Copy debug snapshot", command=self.copy_snapshot).pack(
+            side="left", padx=4
+        )
+        ctk.CTkButton(btns, text="Build plan…", command=self.show_plan).pack(
+            side="left", padx=4
+        )
+
+        # Right: segments + log
+        right = ctk.CTkFrame(body, width=280)
+        right.pack(side="left", fill="both", padx=(8, 0))
+        right.pack_propagate(False)
+        ctk.CTkLabel(right, text="Segments", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(8, 4)
+        )
+        self.seg_box = ctk.CTkTextbox(right, height=200, font=ctk.CTkFont(family="monospace", size=12))
+        self.seg_box.pack(fill="x", padx=6, pady=4)
+        ctk.CTkLabel(right, text="Log", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(8, 4)
+        )
+        self.log_box = ctk.CTkTextbox(right, font=ctk.CTkFont(family="monospace", size=11))
+        self.log_box.pack(fill="both", expand=True, padx=6, pady=(0, 8))
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def log(self, msg: str):
+        self.log_box.insert("end", msg.rstrip() + "\n")
+        self.log_box.see("end")
+
+    # ---------------------------------------------------------- folder / load
+    def pick_folder(self):
+        path = filedialog.askdirectory(title="Workout folder (one .fit + videos/photos)")
+        if path:
+            self.load_folder(path)
+
+    def load_folder(self, path: str):
+        self.stop_play()
+        try:
+            fit_path, videos, photos = wo.discover_batch(path)
+            records, start_time, gps_points = wo.parse_fit(fit_path)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            self.log(f"ERROR: {e}")
+            return
+
+        self.folder = path
+        self.fit_path = fit_path
+        self.videos = videos
+        self.photos = photos
+        self.records = records
+        self.start_time = start_time
+        self.gps_points = gps_points
+        forced = None if self.sport_var.get() == "auto" else self.sport_var.get()
+        session = None
+        try:
+            session = wo.read_session_sport(fit_path)
+        except Exception:
+            session = None
+        self.sport = wo.detect_sport(
+            records, forced=forced, fit_path=fit_path, session=session
+        )
+        self._session = session
+
+        self.folder_label.configure(text=f"{path}   |  {Path(fit_path).name}")
+        sport_detail = self.sport
+        if session and (session.get("sport") is not None or session.get("sport_name")):
+            sport_detail = (
+                f"{self.sport}  (session sport={session.get('sport')!r} "
+                f"sub={session.get('sub_sport')!r} name={session.get('sport_name')!r})"
+            )
+        self.info_vars["sport"].set(f"Sport: {sport_detail}")
+        self.log(f"Loaded folder: {path}")
+        self.log(f"FIT: {Path(fit_path).name}  start={start_time}  points={len(records)}")
+        self.log(f"Videos={len(videos)}  Photos={len(photos)}  sport={sport_detail}")
+
+        for w in self._media_buttons:
+            w.destroy()
+        self._media_buttons.clear()
+
+        for v in videos:
+            name = Path(v).name
+            b = ctk.CTkButton(
+                self.media_list, text=f"▶ {name}", anchor="w",
+                command=lambda p=v: self.select_clip(p, "video"),
+            )
+            b.pack(fill="x", pady=2, padx=2)
+            self._media_buttons.append(b)
+        for ph in photos:
+            name = Path(ph).name
+            b = ctk.CTkButton(
+                self.media_list, text=f"🖼 {name}", anchor="w",
+                command=lambda p=ph: self.select_clip(p, "photo"),
+            )
+            b.pack(fill="x", pady=2, padx=2)
+            self._media_buttons.append(b)
+
+        if videos:
+            self.select_clip(videos[0], "video")
+        elif photos:
+            self.select_clip(photos[0], "photo")
+
+    def on_factor_change(self, _value=None):
+        try:
+            self.factor = float(self.factor_var.get())
+        except ValueError:
+            self.factor = 15.0
+        if self.current_path and self.kind == "video":
+            self.reanalyze()
+
+    def on_sport_change(self, _value=None):
+        if self.records is None:
+            return
+        forced = None if self.sport_var.get() == "auto" else self.sport_var.get()
+        session = getattr(self, "_session", None)
+        self.sport = wo.detect_sport(
+            self.records, forced=forced, fit_path=self.fit_path, session=session
+        )
+        self.info_vars["sport"].set(f"Sport: {self.sport}")
+        self.update_readout(self._current_file_t())
+
+    # ---------------------------------------------------------- clip select
+    def select_clip(self, path: str, kind: str):
+        self.stop_play()
+        self.current_path = path
+        self.kind = kind
+        self.log(f"Select [{kind}] {Path(path).name}")
+
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+        if kind == "photo":
+            self.segments = [(0.0, 1.0, 1.0)]
+            self.video_to_real, _, _ = wo.build_time_map(self.segments)
+            self.duration = 1.0
+            self.fps = 1.0
+            self.align_offset = 0.0
+            self.align_note = "photo (EXIF → FIT)"
+            self._show_photo(path)
+            self.scrub.configure(from_=0, to=1)
+            self.scrub.set(0)
+            self._update_segments_box()
+            self.update_readout(0.0)
+            return
+
+        # Video
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            messagebox.showerror("Video", f"Cannot open {path}")
+            return
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        n = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.duration = n / self.fps if self.fps > 0 else 0.0
+        self.scrub.configure(from_=0, to=max(self.duration, 0.01))
+        self.scrub.set(0)
+
+        auto = wo.compute_auto_align_offset(path, self.start_time)
+        if auto is not None:
+            self.align_offset = float(auto)
+            self.align_note = f"auto {self.align_offset:.1f}s"
+        else:
+            self.align_offset = self.manual_offset
+            self.align_note = "no creation_time (offset 0 or manual)"
+
+        self.log(f"  duration={self.duration:.2f}s fps={self.fps:.3f} align={self.align_note}")
+        self.reanalyze()
+        self.show_frame_at(0.0)
+
+    def reanalyze(self):
+        if not self.current_path or self.kind != "video":
+            return
+        self.log(f"Analyzing segments factor={self.factor:g} …")
+        self.update_idletasks()
+
+        def work():
+            try:
+                segs = wo.detect_speed_segments(self.current_path, factor=self.factor)
+                v2r, _, total = wo.build_time_map(segs)
+                self.after(0, lambda: self._apply_segments(segs, v2r, total))
+            except Exception as e:
+                self.after(0, lambda: self.log(f"Segment error: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_segments(self, segs, v2r, total):
+        self.segments = segs
+        self.video_to_real = v2r
+        self._update_segments_box()
+        self.log(f"  segments={len(segs)}  real covered≈{total:.1f}s")
+        self.update_readout(self._current_file_t())
+
+    def _update_segments_box(self):
+        self.seg_box.delete("1.0", "end")
+        if not self.segments:
+            self.seg_box.insert("end", "(none)\n")
+            return
+        for s, e, sp in self.segments:
+            self.seg_box.insert("end", f"{s:7.1f} → {e:7.1f}s   {sp:g}x\n")
+
+    # ---------------------------------------------------------- preview
+    def _show_photo(self, path: str):
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((self.PREVIEW_W, self.PREVIEW_H))
+        canvas = Image.new("RGB", (self.PREVIEW_W, self.PREVIEW_H), (20, 20, 20))
+        canvas.paste(img, ((self.PREVIEW_W - img.width) // 2, (self.PREVIEW_H - img.height) // 2))
+        self._photo_image = ImageTk.PhotoImage(canvas)
+        self.preview_label.configure(image=self._photo_image, text="")
+
+    def show_frame_at(self, t: float):
+        if self.cap is None or self.kind != "video":
+            return
+        t = max(0.0, min(t, max(self.duration - 1e-3, 0.0)))
+        self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        ok, frame = self.cap.read()
+        if not ok:
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = frame.shape[:2]
+        scale = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        img = Image.fromarray(frame)
+        canvas = Image.new("RGB", (self.PREVIEW_W, self.PREVIEW_H), (20, 20, 20))
+        canvas.paste(img, ((self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2))
+        self._photo_image = ImageTk.PhotoImage(canvas)
+        self.preview_label.configure(image=self._photo_image, text="")
+        self.time_label.configure(text=f"{fmt_hms(t)} / {fmt_hms(self.duration)}")
+        self.update_readout(t)
+
+    def _current_file_t(self) -> float:
+        try:
+            return float(self.scrub.get())
+        except Exception:
+            return 0.0
+
+    def on_scrub(self, value):
+        if self.playing:
+            return
+        t = float(value)
+        if self.kind == "video":
+            self.show_frame_at(t)
+        else:
+            self.update_readout(0.0)
+
+    def _stop_ffplay(self):
+        proc = self._ffplay_proc
+        self._ffplay_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:
+            pass
+
+    def _start_ffplay(self, start_s: float):
+        """Play audio (no video window) from start_s via ffplay."""
+        self._stop_ffplay()
+        if not self.current_path or self.kind != "video":
+            return
+        start_s = max(0.0, float(start_s))
+        cmd = [
+            "ffplay",
+            "-nodisp",
+            "-autoexit",
+            "-loglevel", "quiet",
+            "-ss", f"{start_s:.3f}",
+            "-i", self.current_path,
+        ]
+        try:
+            self._ffplay_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.log(f"ffplay audio from {start_s:.2f}s")
+        except FileNotFoundError:
+            self.log("ffplay not found (install ffmpeg); video-only preview")
+            self._ffplay_proc = None
+        except Exception as e:
+            self.log(f"ffplay error: {e}")
+            self._ffplay_proc = None
+
+    def toggle_play(self):
+        if self.kind != "video" or self.cap is None:
+            return
+        if self.playing:
+            self.playing = False
+            if self.play_job:
+                self.after_cancel(self.play_job)
+                self.play_job = None
+            self._stop_ffplay()
+        else:
+            self.playing = True
+            self._start_ffplay(self._current_file_t())
+            self._play_tick()
+
+    def stop_play(self):
+        self.playing = False
+        if self.play_job:
+            self.after_cancel(self.play_job)
+            self.play_job = None
+        self._stop_ffplay()
+
+    def _play_tick(self):
+        if not self.playing or self.cap is None:
+            return
+        t = self._current_file_t() + (1.0 / max(self.fps, 1.0))
+        if t >= self.duration:
+            self.playing = False
+            self._stop_ffplay()
+            return
+        # If ffplay exited early, keep video advancing without audio
+        if self._ffplay_proc is not None and self._ffplay_proc.poll() is not None:
+            self._ffplay_proc = None
+        self.scrub.set(t)
+        self.show_frame_at(t)
+        delay = max(1, int(1000 / max(self.fps, 1.0)))
+        self.play_job = self.after(delay, self._play_tick)
+
+    # ---------------------------------------------------------- readout
+    def update_readout(self, file_t: float):
+        self.info_vars["file_t"].set(f"File time: {file_t:.2f}s  ({fmt_hms(file_t)})")
+        # Movie time = position in the clip as played (same as file time for our pipeline)
+        self.info_vars["movie_t"].set(
+            f"Movie time: {fmt_hms(file_t)} / {fmt_hms(self.duration)}  "
+            f"({file_t:.2f}s / {self.duration:.2f}s)"
+        )
+
+        if self.kind == "photo" and self.current_path and self.start_time is not None:
+            try:
+                offset_hours, _ = wo.resolve_display_offset_hours(
+                    self.videos[0] if self.videos else None, "auto", None
+                )
+                real_t, photo_dt = wo.photo_align_offset(
+                    self.current_path, self.start_time, offset_hours=offset_hours
+                )
+                data = wo.lookup_at_real_t(
+                    self.records, self.start_time, self.gps_points, real_t
+                )
+                self.info_vars["factor"].set("Factor: 1× (photo)")
+                self.info_vars["real_t"].set(f"Real (FIT) t: {real_t:.1f}s")
+                self.info_vars["fit_clock"].set(f"FIT clock: {fmt_ts(data['ts'])}")
+                self.info_vars["movie_t"].set(
+                    f"Movie time: still ({fmt_hms(0)} / photo hold)"
+                )
+                self.info_vars["align"].set(f"Photo EXIF≈ {fmt_ts(photo_dt)}  → real_t {real_t:.1f}s")
+                self.info_vars["sample"].set(self._sample_line(data))
+            except Exception as e:
+                self.info_vars["align"].set(f"Photo align error: {e}")
+            return
+
+        fac = factor_at(self.segments, file_t) if self.segments else 1.0
+        self.info_vars["factor"].set(f"Factor: {fac:g}×")
+
+        if self.video_to_real is None or self.start_time is None:
+            self.info_vars["real_t"].set("Real (FIT) t: --")
+            self.info_vars["fit_clock"].set("FIT clock: --")
+            self.info_vars["sample"].set("Sample: --")
+            self.info_vars["align"].set(f"Align: {self.align_note}")
+            return
+
+        real_t = self.video_to_real(file_t) + self.align_offset
+        data = wo.lookup_at_real_t(
+            self.records, self.start_time, self.gps_points, real_t
+        )
+        self.info_vars["real_t"].set(
+            f"Real (FIT) t: {real_t:.1f}s  (map {self.video_to_real(file_t):.1f} + align {self.align_offset:.1f})"
+        )
+        self.info_vars["fit_clock"].set(f"FIT clock: {fmt_ts(data['ts'])}")
+        self.info_vars["align"].set(f"Align: {self.align_note}")
+        self.info_vars["sample"].set(self._sample_line(data))
+
+    def _sample_line(self, data: dict) -> str:
+        parts = []
+        if self.sport == "dive":
+            for key, label, unit in (
+                ("depth", "depth", "m"),
+                ("max_depth", "max", "m"),
+                ("hr", "HR", "bpm"),
+                ("temp", "temp", "°C"),
+                ("ndl", "NDL", "s"),
+                ("tts", "TTS", "s"),
+            ):
+                v = data.get(key, np.nan)
+                if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                    if key == "hr":
+                        parts.append(f"{label} {int(v)}{unit}")
+                    else:
+                        parts.append(f"{label} {v:.1f}{unit}")
+        else:
+            sp = data.get("speed", np.nan)
+            if sp is not None and not (isinstance(sp, float) and np.isnan(sp)):
+                parts.append(f"speed {sp * 3.6:.1f}km/h")
+            hr = data.get("hr", np.nan)
+            if hr is not None and not (isinstance(hr, float) and np.isnan(hr)):
+                parts.append(f"HR {int(hr)}")
+            elev = data.get("elev", np.nan)
+            if elev is not None and not (isinstance(elev, float) and np.isnan(elev)):
+                parts.append(f"elev {elev:.0f}m")
+        return "Sample: " + (", ".join(parts) if parts else "--")
+
+    # ---------------------------------------------------------- plan / copy
+    def show_plan(self):
+        if not self.folder or self.records is None:
+            messagebox.showinfo("Plan", "Load a folder first")
+            return
+        try:
+            plan, _ = wo.build_batch_plan(
+                self.videos, self.photos, self.fit_path,
+                self.records, self.start_time, self.gps_points,
+                extra_offset=0.0, auto_align=True, offset_explicit=False,
+                factor=self.factor, time_mode="auto", utc_offset=None,
+            )
+        except Exception as e:
+            messagebox.showerror("Plan", str(e))
+            return
+        lines = ["Final render plan:"]
+        for i, e in enumerate(plan, 1):
+            if e["kind"] == "video_slice":
+                lines.append(
+                    f"  {i}. [video] {Path(e['path']).name}  {e['t0']:.2f}-{e['t1']:.2f}s"
+                )
+            else:
+                lines.append(f"  {i}. [photo] {Path(e['path']).name}")
+        text = "\n".join(lines)
+        self.log(text)
+        win = ctk.CTkToplevel(self)
+        win.title("Render plan")
+        win.geometry("560x400")
+        box = ctk.CTkTextbox(win, font=ctk.CTkFont(family="monospace", size=12))
+        box.pack(fill="both", expand=True, padx=8, pady=8)
+        box.insert("end", text)
+
+    def copy_snapshot(self):
+        t = self._current_file_t()
+        lines = [
+            f"folder={self.folder}",
+            f"fit={self.fit_path}",
+            f"clip={self.current_path}",
+            f"kind={self.kind}",
+            f"sport={self.sport}",
+            f"factor_setting={self.factor}",
+            f"file_t={t:.3f}",
+            f"align={self.align_note} offset={self.align_offset:.3f}",
+        ]
+        if self.segments and self.video_to_real:
+            fac = factor_at(self.segments, t)
+            real_t = self.video_to_real(t) + self.align_offset
+            lines.append(f"factor_at_t={fac:g}")
+            lines.append(f"real_t={real_t:.3f}")
+            data = wo.lookup_at_real_t(
+                self.records, self.start_time, self.gps_points, real_t
+            )
+            lines.append(f"fit_clock={fmt_ts(data['ts'])}")
+            lines.append(self._sample_line(data))
+            lines.append("segments:")
+            for s, e, sp in self.segments:
+                lines.append(f"  {s:.2f}-{e:.2f} {sp:g}x")
+        text = "\n".join(lines)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.log("Debug snapshot copied to clipboard")
+
+    def on_close(self):
+        self.stop_play()
+        self._stop_ffplay()
+        if self.cap is not None:
+            self.cap.release()
+        self.destroy()
+
+
+def main():
+    folder = sys.argv[1] if len(sys.argv) > 1 else None
+    app = DebugApp(initial_folder=folder)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
+
+==> README.md <==
+# Workout Overlay
+
+**Version 1.1** — DJI Osmo + Zepp/Amazfit FIT on Linux
+
+Overlay Amazfit / Zepp FIT telemetry onto action-camera video and stills.  
+Built for real outings: one workout FIT, many Osmo (or phone) clips, photos taken between or **during** clips, optional hyperlapse, batch export with transitions, outdoor and **dive** panels.
+
+<img width="1931" height="1194" alt="Screenshot_2026-10-09_16-58-32" src="https://github.com/user-attachments/assets/2f17610c-0349-44d3-9c2a-2d8c9ad54cb3" />
+
+
+## Features
+
+- **Single clip** or **batch folder** (one `.fit` + many videos/photos)
+- **Outdoor panel**: time, speed, heart rate, elevation, distance + GPS minimap
+- **Dive panel** (auto when FIT has depth samples): time, depth, max depth, heart rate, temperature; plus NDL, TTS, ascent rate, CNS when present in the FIT
+- **Auto-align** video to FIT via MP4 `creation_time` (default on)
+- **Hyperlapse**: silent sections use `--factor` (default 15×); audio sections stay 1×
+- **Photos** in batch: EXIF time → FIT (local EXIF converted with display TZ offset)
+- **Mid-clip photos**: stills taken while a video was recording are inserted by splitting that clip
+- **Transitions**: `--transition-seconds N` fades out to black then in (extra time; content not shortened)
+- **Preview** mode: 1080p for faster test renders
+- Time display: `--time auto|local|utc` and optional `--utc-offset`
+- **`--sport`**: `auto` | `outdoor` | `dive` | `freedive` | `scuba`
+
+## Requirements
+
+- Linux (tested on Pop!_OS)
+- Python 3.10+
+- `ffmpeg` / `ffprobe` on `PATH`
+- Python packages listed in `requirements.txt`
+
+## Setup
+
+```bash
+chmod +x install_overlay.sh run_overlay.sh
+./install_overlay.sh
+```
+
+Creates `~/dashboard-env` and installs dependencies.
+
+Manual alternative:
+
+```bash
+python3 -m venv ~/dashboard-env
+source ~/dashboard-env/bin/activate
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Single clip
+
+```bash
+./run_overlay.sh video.mp4 activity.fit --preview
+./run_overlay.sh video.mp4 activity.fit -o final.mp4
+./run_overlay.sh video.mp4 activity.fit --factor 10 --preview
+./run_overlay.sh video.mp4 activity.fit -3 --preview          # manual align offset (seconds)
+```
+
+### Batch (recommended for real workouts)
+
+Put **exactly one** `.fit` and any mix of videos/photos in a folder:
+
+```text
+my_walk/
+  Zepp20261007....fit
+  DJI_....MP4
+  DJI_....JPG
+  PXL_....jpg
+```
+
+```bash
+./run_overlay.sh --batch ./my_walk --preview \
+  --photo-seconds 3 \
+  --transition-seconds 2 \
+  -o walk_batch.mp4
+```
+
+### Dive / underwater
+
+FIT files with depth samples switch to the dive panel automatically. Underwater is usually pure 1× video:
+
+```bash
+./run_overlay.sh --batch ./my_dive --factor 1 --preview -o dive_out.mp4
+./run_overlay.sh dive.mp4 dive.fit --sport dive --factor 1 -o dive_out.mp4
+```
+
+| Option | Meaning | Default |
+|--------|---------|---------|
+| `--batch DIR` | Process folder | — |
+| `--preview` | Render at 1080p | off (full resolution) |
+| `--photo-seconds N` | How long each still is shown | `3` |
+| `--transition-seconds N` | Fade through black between clips (extra time) | `0` (hard cut) |
+| `--factor N` | Speed assumed for **silent** sections | `15` |
+| `--sport MODE` | Panel fields: `auto`, `outdoor`, `dive`, `freedive`, `scuba` | `auto` |
+| `--time auto\|local\|utc` | How TIME is displayed | `auto` |
+| `--utc-offset HOURS` | Force display timezone offset | from video when possible |
+| `--no-auto-align` | Do not use MP4 creation_time vs FIT start | auto-align on |
+| `-o FILE` | Output path | `workout_overlay.mp4` / `workout_batch.mp4` |
+
+`freedive` and `scuba` both use the dive panel; extra scuba metrics (NDL, TTS, …) appear only if the FIT contains them.
+
+## Alignment model
+
+| Media | How it is placed on the FIT timeline |
+|-------|--------------------------------------|
+| **Video** | MP4 `creation_time` (UTC) vs FIT start → offset (auto). Hyperlapse map from audio. |
+| **Photo** | EXIF capture time treated as **local**; converted to UTC with the same offset as `--time auto` / `--utc-offset`, then placed on the FIT timeline. |
+| **Mid-clip photo** | If photo time falls inside a video’s FIT window, that video is split and the still is inserted at that moment. |
+
+Original DJI files keep reliable timestamps. Edited/merged exports often lose `creation_time` — use a manual offset if needed.
+
+## Hyperlapse note
+
+Detection assumes **silent ≈ sped-up** and **audio ≈ 1×**.  
+Quiet 1× audio (e.g. mic noise cancellation) can be mistaken for hyperlapse. For pure 1× walks or underwater:
+
+```bash
+--factor 1
+```
+
+For intentional hyperlapse, leave the default (`15`) and prefer **noise cancellation off** on the camera so silence tracking stays honest.
+
+## Dive fields
+
+When the panel is in dive mode, rows are drawn only if the value exists in the FIT:
+
+| Label | FIT source |
+|-------|------------|
+| DEPTH | `depth` |
+| MAX DEPTH | running max of `depth` |
+| HEART RATE | `heart_rate` |
+| TEMP | `temperature` |
+| NDL | `ndl_time` / `ndl` (when present) |
+| TTS | `time_to_surface` (when present) |
+| ASCENT | `ascent_rate` (when present) |
+| CNS | `cns_load` (when present) |
+
+Amazfit freedive exports typically include depth, temperature, and heart rate. Scuba-specific fields depend on the watch model and session.
+
+## Debug GUI
+
+Optional CustomTkinter tool for alignment / hyperlapse debugging:
+
+```bash
+pip install customtkinter   # once, in ~/dashboard-env
+./run_debug_gui.sh
+./run_debug_gui.sh /path/to/batch_folder
+```
+
+- Pick a batch folder (one `.fit` + videos/photos)
+- Preview clip with scrub; see **file time**, **detected factor (1×/15×)**, **mapped FIT time**, sample telemetry
+- Segment list, auto-align note, render plan, copy debug snapshot
+
+## Project layout
+
+```text
+workout_overlay.py   # main tool
+run_overlay.sh       # activates venv, forwards args
+install_overlay.sh   # one-time setup
+requirements.txt
+LICENSE              # MIT
+README.md
+.gitignore
+```
+
+## Scope
+
+**Supported today**
+
+- Linux CLI
+- DJI Osmo-style MP4/JPG + phone stills
+- Zepp / Amazfit (and typical FIT) activity files
+- Single + batch pipelines, auto-align, mid-clip photos, fade transitions
+- Outdoor and dive telemetry panels (`--sport` / auto-detect from depth)
+
+**Not yet**
+
+- Official Windows/macOS support (may work; not tested)
+- Full camera-specific profiles beyond current DJI/GoPro heuristics
+- GUI
+- Map tiles under the minimap
+- Perimeter / Mimo-style dive layout (depth graph)
+
+## Roadmap
+
+Ordered for stability first (CLI before GUI):
+
+1. **Device profiles** — thin adapters for video start time and activity load.
+2. **Sport defaults** — walk, run, bike, freedive, scuba field lists and sensible `--factor` defaults.
+3. **Optional segment map** — side file or tiny mark script for mixed hyperlapse clips.
+4. **Cross-platform GUI** — simple wrapper once CLI flags are stable.
+5. **Extras** — map tiles, perimeter dive layout, FIT GPS → timezone for travel.
+
+## Contributing
+
+- Keep media and personal FIT/video files out of git (see `.gitignore`).
+- Prefer small PRs: one profile, one bugfix, or docs.
+- Test on a short clip before a full batch.
+- For new cameras, implement start-time detection first; full telemetry-from-camera is optional.
+
+
+## Acknowledgments
+
+This project was developed with assistance from [Grok](https://grok.x.ai) (xAI).  
+Design decisions, testing, and maintenance are by the project author.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
