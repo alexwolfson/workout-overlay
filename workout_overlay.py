@@ -540,7 +540,7 @@ def normalize_phone_video_clip(
     cmd.extend([
         "-filter_complex", filter_complex,
         "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-video_track_timescale", "90000",
         "-c:a", "aac",
         "-t", f"{slice_dur:.6f}",
         dst_video_path,
@@ -618,7 +618,7 @@ def compress_silent_video(video_path, segments, factor, out_w=None, out_h=None, 
         "-i", video_path,
         "-filter_complex", all_filters,
         "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-video_track_timescale", "90000",
         "-c:a", "aac",
         tmp_out,
     ]
@@ -645,11 +645,18 @@ def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, fact
             "-ar", "16000", "-ac", "1", tmp_wav,
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        y, sr = librosa.load(tmp_wav, sr=None, mono=True)
-        duration = float(librosa.get_duration(y=y, sr=sr))
+        import wave
+        with wave.open(tmp_wav, "rb") as wf:
+            sr = wf.getframerate()
+            n_frames = wf.getnframes()
+            raw_bytes = wf.readframes(n_frames)
+        samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        duration = float(len(samples)) / float(sr) if sr > 0 else 0.0
         hop = 512
-        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
-        times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+        n_hops = max(1, len(samples) // hop)
+        trimmed = samples[: n_hops * hop].reshape(n_hops, hop)
+        rms = np.sqrt(np.mean(trimmed * trimmed, axis=1))
+        times = (np.arange(n_hops, dtype=np.float64) * hop) / float(sr)
         rms = np.maximum(rms, 1e-10)
         rms_db = 20.0 * np.log10(rms)
         p10 = float(np.percentile(rms_db, 10))
@@ -1278,7 +1285,8 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
                    factor=15.0, file_t_start=0.0, file_t_end=None,
                    segments=None, fixed_offset=None, sport=None,
                    phone_vertical="blur", compress_silent=False,
-                   cam_audio_source=None, cam_audio_t0=None, cam_audio_t1=None):
+                   cam_audio_source=None, cam_audio_t0=None, cam_audio_t1=None,
+                   target_fps=None):
     """Render overlay for a full video or a [file_t_start, file_t_end) slice."""
     if records is None or start_time is None or gps_points is None:
         records, start_time, gps_points = parse_fit(fit_path)
@@ -1349,7 +1357,8 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        fps = float(target_fps) if target_fps else src_fps
         src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -1438,15 +1447,15 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
         has_audio = has_audio_stream(video_path)
         if has_audio:
             af = (
-                f"aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur - fade_dur:.3f}:d={fade_dur:.3f}"
+                f"asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={max(0.0, dur - fade_dur):.3f}:d={fade_dur:.3f}"
             )
             cmd = [
                 "ffmpeg", "-y",
                 "-i", tmp_video,
+                "-i", video_path,
                 "-ss", f"{t0:.6f}",
                 "-to", f"{t1:.6f}",
-                "-i", video_path,
                 "-map", "0:v:0",
                 "-map", "1:a:0",
                 "-af", af,
@@ -1545,7 +1554,12 @@ def discover_batch(folder):
         raise RuntimeError(f"Not a directory: {folder}")
 
     fits = list({p.resolve(): p for p in list(folder.glob("*.fit")) + list(folder.glob("*.FIT"))}.values())
-    videos = [p for p in folder.iterdir() if p.is_file() and p.suffix in VIDEO_EXTS]
+    videos = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and p.suffix in VIDEO_EXTS
+        and not p.stem.endswith(("_overlay", "_batch"))
+    ]
     photos = [p for p in folder.iterdir() if p.is_file() and p.suffix in PHOTO_EXTS]
 
     if len(fits) == 0:
@@ -1691,6 +1705,7 @@ def concat_videos(video_paths, output_path, transition_seconds=0.0):
             list_file.close()
             cmd = [
                 "ffmpeg", "-y",
+                "-fflags", "+genpts",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file.name,
@@ -1739,6 +1754,7 @@ def concat_videos(video_paths, output_path, transition_seconds=0.0):
             list_file.close()
             cmd = [
                 "ffmpeg", "-y",
+                "-fflags", "+genpts",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file.name,
@@ -2064,11 +2080,11 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
         fps = max(1.0, round(fps, 3))
 
     if preview:
+        scale = 1080.0 / float(out_h)
+        out_w = int(round(out_w * scale))
         out_h = 1080
-        out_w = int(out_w * (1080.0 / out_h))
         if out_w % 2:
             out_w += 1
-        out_h = 1080
     else:
         if out_w % 2:
             out_w += 1
@@ -2125,6 +2141,7 @@ def run_batch(folder, output_path, extra_offset=0.0, step=0.20, preview=False,
                     create_overlay(
                         e["path"], fit_path, output_path=out_clip,
                         extra_offset=extra_offset, step=step, preview=preview,
+                        target_fps=fps,
                         time_mode=time_mode, utc_offset=utc_offset,
                         auto_align=False, offset_explicit=False,
                         records=records, start_time=start_time, gps_points=gps_points,
