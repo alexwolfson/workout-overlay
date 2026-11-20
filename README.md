@@ -241,3 +241,18 @@ Design decisions, testing, and maintenance are by the project author.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Interactive Highlight Trimming (`debug_gui.py` + `segments.json`)
+
+Use `debug_gui.py` to trim long rides or dives down to a tight **2–5 minute** highlight reel before rendering:
+
+1. **Launch the visual previewer on your batch folder:**
+   ```bash
+   ./run_debug_gui.sh /path/to/workout_folder
+   ```
+2. **Mark `15×` speedup regions (`I` / `O`) or complete cuts (`X` / `C`):**
+   - **`15× In [I]` → `15× Out [O]`**: Smoothly accelerates silent `1×` stretches by `15×` using frame blending (`tblend`) while leaving native DJI Hyperlapse stretches untouched.
+   - **`Cut In [X]` → `Cut Out [C]`**: Removes boring sections completely (`0s` output) while advancing the FIT telemetry clock cleanly across the jump.
+   - **Live `Est. Output` counter**: Tracks predicted final runtime in the top bar (turning green inside the **2–5 minute** target window).
+3. **Render automatically with `./run_overlay.sh`:**
+   - Markers are saved automatically to `<workout_folder>/segments.json` and applied whenever you run `./run_overlay.sh --batch /path/to/workout_folder`.

@@ -11,10 +11,12 @@ with file time, detected factor (1x/15x), mapped FIT time, and sample values.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -151,6 +153,11 @@ class DebugApp(ctk.CTk):
             width=100, command=self.on_sport_change,
         )
         self.sport_menu.pack(side="left", padx=(0, 8))
+        self.est_out_label = ctk.CTkLabel(
+            top, text="Est. Output: --:-- (Target: 2-5m)",
+            font=ctk.CTkFont(weight="bold"), padx=10, corner_radius=6,
+        )
+        self.est_out_label.pack(side="right", padx=(8, 4))
 
         # Controls bar for V1.2 features
         opt_bar = ctk.CTkFrame(self)
@@ -222,6 +229,20 @@ class DebugApp(ctk.CTk):
         self.time_label = ctk.CTkLabel(transport, text="00:00 / 00:00", width=110)
         self.time_label.pack(side="left")
 
+        mark_bar = ctk.CTkFrame(center)
+        mark_bar.pack(fill="x", padx=8, pady=(0, 4))
+        ctk.CTkButton(mark_bar, text="15× In [I]", width=85, command=lambda: self.mark_in("speedup")).pack(side="left", padx=3, pady=4)
+        ctk.CTkButton(mark_bar, text="15× Out [O]", width=95, command=lambda: self.mark_out("speedup")).pack(side="left", padx=3, pady=4)
+        ctk.CTkButton(mark_bar, text="Cut In [X]", width=85, fg_color="#B91C1C", hover_color="#991B1B", command=lambda: self.mark_in("cut")).pack(side="left", padx=3, pady=4)
+        ctk.CTkButton(mark_bar, text="Cut Out [C]", width=95, fg_color="#B91C1C", hover_color="#991B1B", command=lambda: self.mark_out("cut")).pack(side="left", padx=3, pady=4)
+        self.pending_in_label = ctk.CTkLabel(mark_bar, text="In: --:--", width=110)
+        self.pending_in_label.pack(side="left", padx=6)
+        ctk.CTkButton(mark_bar, text="Clear Clip", width=80, fg_color="#6B7280", command=self.clear_clip_markers).pack(side="right", padx=4, pady=4)
+        self.bind("<Key-i>", lambda _e: self.mark_in("speedup"))
+        self.bind("<Key-o>", lambda _e: self.mark_out("speedup"))
+        self.bind("<Key-x>", lambda _e: self.mark_in("cut"))
+        self.bind("<Key-c>", lambda _e: self.mark_out("cut"))
+
         # Debug readout
         info = ctk.CTkFrame(center)
         info.pack(fill="x", padx=8, pady=4)
@@ -259,8 +280,13 @@ class DebugApp(ctk.CTk):
         right = ctk.CTkFrame(body, width=280)
         right.pack(side="left", fill="both", padx=(8, 0))
         right.pack_propagate(False)
+        ctk.CTkLabel(right, text="15× Speedup Markers", font=ctk.CTkFont(weight="bold")).pack(
+            anchor="w", padx=8, pady=(8, 2)
+        )
+        self.markers_frame = ctk.CTkScrollableFrame(right, height=130)
+        self.markers_frame.pack(fill="x", padx=6, pady=(0, 4))
         ctk.CTkLabel(right, text="Segments", font=ctk.CTkFont(weight="bold")).pack(
-            anchor="w", padx=8, pady=(8, 4)
+            anchor="w", padx=8, pady=(4, 2)
         )
         self.seg_box = ctk.CTkTextbox(right, height=200, font=ctk.CTkFont(family="monospace", size=12))
         self.seg_box.pack(fill="x", padx=6, pady=4)
@@ -348,6 +374,9 @@ class DebugApp(ctk.CTk):
             b.pack(fill="x", pady=2, padx=2)
             self._media_buttons.append((ph, b, label))
 
+        self._segments_data = wo.load_segments_json(path)
+        self._pending_in = None
+        self._recalc_est_output()
         if videos:
             self.select_clip(videos[0], "video")
         elif photos:
@@ -389,6 +418,10 @@ class DebugApp(ctk.CTk):
                     btn.configure(fg_color="#D97706", text=f"▶ {base_label}")
                 else:
                     btn.configure(fg_color=default_fg, text=base_label)
+        self._pending_in = None
+        if hasattr(self, "pending_in_label"):
+            self.pending_in_label.configure(text="In: --:--")
+        self._refresh_markers_list()
         self.log(f"Select [{kind}] {Path(path).name}")
 
         if self.cap is not None:
@@ -472,26 +505,33 @@ class DebugApp(ctk.CTk):
         self._photo_image = ImageTk.PhotoImage(canvas)
         self.preview_label.configure(image=self._photo_image, text="")
 
-    def show_frame_at(self, t: float):
+    def show_frame_at(self, t: float, sequential: bool = False):
         if self.cap is None or self.kind != "video":
             return
         t = max(0.0, min(t, max(self.duration - 1e-3, 0.0)))
-        self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+        if not sequential:
+            self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
         ok, frame = self.cap.read()
         if not ok:
             return
+        if sequential:
+            pos_ms = self.cap.get(cv2.CAP_PROP_POS_MSEC)
+            if pos_ms and pos_ms > 0:
+                t = pos_ms / 1000.0
+                self.scrub.set(t)
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w = frame.shape[:2]
         scale = min(self.PREVIEW_W / w, self.PREVIEW_H / h)
         nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
         img = Image.fromarray(frame)
         canvas = Image.new("RGB", (self.PREVIEW_W, self.PREVIEW_H), (20, 20, 20))
         canvas.paste(img, ((self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2))
-        self._photo_image = ImageTk.PhotoImage(canvas)
+        self._photo_image = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(self.PREVIEW_W, self.PREVIEW_H))
         self.preview_label.configure(image=self._photo_image, text="")
         self.time_label.configure(text=f"{fmt_hms(t)} / {fmt_hms(self.duration)}")
         self.update_readout(t)
+        self.preview_label.update_idletasks()
 
     def _current_file_t(self) -> float:
         try:
@@ -562,11 +602,20 @@ class DebugApp(ctk.CTk):
             self._stop_ffplay()
         else:
             self.playing = True
-            self._start_ffplay(self._current_file_t())
+            cur_t = self._current_file_t()
+            self._play_wall_start = time.monotonic()
+            self._play_file_start = cur_t
+            self._ffplay_active_1x = False
+            if self.cap is not None and self.kind == "video":
+                self.cap.set(cv2.CAP_PROP_POS_MSEC, cur_t * 1000.0)
+            if factor_at(self.segments, cur_t) <= 1.01:
+                self._start_ffplay(cur_t)
+                self._ffplay_active_1x = True
             self._play_tick()
 
     def stop_play(self):
         self.playing = False
+        self._ffplay_active_1x = False
         if self.play_job:
             self.after_cancel(self.play_job)
             self.play_job = None
@@ -575,18 +624,29 @@ class DebugApp(ctk.CTk):
     def _play_tick(self):
         if not self.playing or self.cap is None:
             return
-        t = self._current_file_t() + (1.0 / max(self.fps, 1.0))
-        if t >= self.duration:
+        target_t = self._play_file_start + (time.monotonic() - self._play_wall_start)
+        if target_t >= self.duration:
             self.playing = False
+            self._ffplay_active_1x = False
             self._stop_ffplay()
             return
-        # If ffplay exited early, keep video advancing without audio
         if self._ffplay_proc is not None and self._ffplay_proc.poll() is not None:
+            self._ffplay_active_1x = False
             self._ffplay_proc = None
-        self.scrub.set(t)
-        self.show_frame_at(t)
-        delay = max(1, int(1000 / max(self.fps, 1.0)))
-        self.play_job = self.after(delay, self._play_tick)
+        in_1x = factor_at(self.segments, target_t) <= 1.01
+        if in_1x and not getattr(self, "_ffplay_active_1x", False):
+            self._start_ffplay(target_t)
+            self._ffplay_active_1x = True
+        elif not in_1x and getattr(self, "_ffplay_active_1x", False):
+            self._stop_ffplay()
+            self._ffplay_active_1x = False
+        cur_pos = (self.cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0) / 1000.0
+        while cur_pos + (1.0 / max(self.fps, 1.0)) < target_t - 0.12:
+            if not self.cap.grab():
+                break
+            cur_pos += 1.0 / max(self.fps, 1.0)
+        self.show_frame_at(target_t, sequential=True)
+        self.play_job = self.after(15, self._play_tick)
 
     # ---------------------------------------------------------- readout
     def update_readout(self, file_t: float):
@@ -684,7 +744,7 @@ class DebugApp(ctk.CTk):
                 phone_priority=self.phone_priority_var.get(),
                 phone_vertical=self.phone_vertical_var.get(),
                 keep_camera_audio=self.keep_cam_audio_var.get(),
-                compress_silent=self.compress_silent_var.get(),
+                compress_silent=self.compress_silent_var.get(), dry_run=True,
             )
         except Exception as e:
             messagebox.showerror("Plan", str(e))
@@ -750,6 +810,136 @@ class DebugApp(ctk.CTk):
         self.clipboard_clear()
         self.clipboard_append(text)
         self.log("Debug snapshot copied to clipboard")
+
+
+    def _save_segments_json(self):
+        if not self.folder:
+            return
+        data = getattr(self, "_segments_data", None) or {"version": 1, "default_factor": 15.0, "clips": {}}
+        data["default_factor"] = float(self.factor)
+        out_path = Path(self.folder) / "segments.json"
+        out_path.write_text(json.dumps(data, indent=2) + chr(10), encoding="utf-8")
+        self.log(f"Saved {out_path.name}")
+
+    def mark_in(self, mode: str = "speedup"):
+        if not self.current_path or self.kind != "video":
+            return
+        if wo.is_phone_video(self.current_path):
+            self.log("Phone videos stay at 1x speed")
+            return
+        t = round(self._current_file_t(), 2)
+        self._pending_in = (t, mode)
+        tag = "CUT" if mode == "cut" else "15×"
+        self.pending_in_label.configure(text=f"{tag} In: {fmt_hms(t)}")
+        self.log(f"Marked {tag} In @ {t:.2f}s")
+
+    def mark_out(self, mode: str = "speedup"):
+        if not self.current_path or self.kind != "video":
+            return
+        pend = getattr(self, "_pending_in", None)
+        if pend is None:
+            self.log("Set Mark In [I or X] first")
+            return
+        t_in, in_mode = pend if isinstance(pend, tuple) else (float(pend), mode)
+        t_out = round(self._current_file_t(), 2)
+        if t_out <= t_in + 0.1:
+            self.log("Mark Out must be after Mark In")
+            return
+        bname = Path(self.current_path).name
+        data = getattr(self, "_segments_data", None) or {"version": 1, "default_factor": 15.0, "clips": {}}
+        clips = data.setdefault("clips", {})
+        cur_list = clips.get(bname, [])
+        entry = {"start": t_in, "end": t_out, "mode": in_mode, "factor": 0.0 if in_mode == "cut" else float(self.factor)}
+        cur_list.append(entry)
+        clips[bname] = wo.normalize_speedup_markers(cur_list, self.duration, default_factor=float(self.factor))
+        self._segments_data = data
+        self._pending_in = None
+        self.pending_in_label.configure(text="In: --:--")
+        self._save_segments_json()
+        self._refresh_markers_list()
+        self._recalc_est_output()
+
+    def delete_marker(self, idx: int):
+        if not self.current_path:
+            return
+        bname = Path(self.current_path).name
+        clips = getattr(self, "_segments_data", {}).get("clips", {})
+        if bname in clips and 0 <= idx < len(clips[bname]):
+            clips[bname].pop(idx)
+            if not clips[bname]:
+                del clips[bname]
+            self._save_segments_json()
+            self._refresh_markers_list()
+            self._recalc_est_output()
+
+    def clear_clip_markers(self):
+        if not self.current_path:
+            return
+        bname = Path(self.current_path).name
+        clips = getattr(self, "_segments_data", {}).get("clips", {})
+        if bname in clips:
+            del clips[bname]
+            self._save_segments_json()
+            self._refresh_markers_list()
+            self._recalc_est_output()
+
+    def _refresh_markers_list(self):
+        for w in self.markers_frame.winfo_children():
+            w.destroy()
+        if not self.current_path or self.kind != "video":
+            ctk.CTkLabel(self.markers_frame, text="(select a video)", text_color="gray").pack(anchor="w", padx=4)
+            return
+        bname = Path(self.current_path).name
+        mlist = getattr(self, "_segments_data", {}).get("clips", {}).get(bname, [])
+        if not mlist:
+            ctk.CTkLabel(self.markers_frame, text="(no 15x markers)", text_color="gray").pack(anchor="w", padx=4)
+            return
+        for idx, m in enumerate(mlist):
+            row = ctk.CTkFrame(self.markers_frame)
+            row.pack(fill="x", pady=2, padx=2)
+            if m.get("mode") == "cut" or float(m.get("factor", 15.0)) == 0.0:
+                saved = m["end"] - m["start"]
+                lbl = f"{fmt_hms(m['start'])}→{fmt_hms(m['end'])} (CUT, -{saved:.0f}s)"
+            else:
+                saved = (m["end"] - m["start"]) * (1.0 - 1.0 / float(m["factor"]))
+                lbl = f"{fmt_hms(m['start'])}→{fmt_hms(m['end'])} ({m['factor']:g}×, -{saved:.0f}s)"
+            ctk.CTkLabel(row, text=lbl, font=ctk.CTkFont(size=11), anchor="w").pack(side="left", padx=4, fill="x", expand=True)
+            ctk.CTkButton(row, text="Jump", width=44, height=22, command=lambda s=m["start"]: (self.scrub.set(s), self.show_frame_at(s))).pack(side="left", padx=2)
+            ctk.CTkButton(row, text="✕", width=26, height=22, fg_color="#DC2626", command=lambda i=idx: self.delete_marker(i)).pack(side="left", padx=2)
+
+    def _recalc_est_output(self):
+        vids = getattr(self, "videos", None) or []
+        photos = getattr(self, "photos", None) or []
+        if not vids and not photos:
+            return
+        dur_cache = getattr(self, "_vid_dur_cache", None)
+        if dur_cache is None:
+            dur_cache = {}
+            self._vid_dur_cache = dur_cache
+        clips_map = (getattr(self, "_segments_data", None) or {}).get("clips", {})
+        def_fac = float(getattr(self, "factor", 15.0) or 15.0)
+
+        total_s = 0.0
+        for vp in vids:
+            vstr = str(vp)
+            if vstr not in dur_cache:
+                dur_cache[vstr] = float(wo.get_media_duration(vstr) or 0.0)
+            vdur = dur_cache[vstr]
+            bname = Path(vstr).name
+            mlist = clips_map.get(bname)
+            if mlist and not wo.is_phone_video(vstr):
+                user_segs = wo.markers_to_segments(mlist, vdur, default_factor=def_fac) or [(0.0, vdur, 1.0)]
+                for s0, e0, sp0 in user_segs:
+                    if float(sp0) == 0.0:
+                        continue
+                    total_s += (e0 - s0) / float(sp0)
+            else:
+                total_s += vdur
+
+        total_s += len(photos) * 3.0
+        mins, secs = divmod(int(round(total_s)), 60)
+        color = "#2FA572" if 120 <= total_s <= 300 else ("#D97706" if total_s > 300 else "#4B5563")
+        self.est_out_label.configure(text=f"Est. Output: {mins}m {secs:02d}s (Target: 2-5m)", fg_color=color)
 
     def on_close(self):
         self.stop_play()

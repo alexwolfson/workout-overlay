@@ -549,87 +549,119 @@ def normalize_phone_video_clip(
     return dst_video_path
 
 
+def normalize_speedup_markers(markers, duration, default_factor=15.0):
+    valid = []
+    for m in markers or []:
+        s = max(0.0, min(float(duration), float(m.get("start", 0.0))))
+        e = max(0.0, min(float(duration), float(m.get("end", 0.0))))
+        mode = str(m.get("mode", "speedup")).lower()
+        raw_f = m.get("factor", 0.0 if mode == "cut" else default_factor)
+        f = 0.0 if mode == "cut" else float(raw_f if raw_f is not None else default_factor)
+        if e > s + 0.05 and (f == 0.0 or f > 1.0):
+            valid.append({"start": round(s, 3), "end": round(e, 3), "factor": f, "mode": "cut" if f == 0.0 else "speedup"})
+    valid.sort(key=lambda x: (x["start"], x["end"]))
+    merged = []
+    for item in valid:
+        if merged and item["start"] <= merged[-1]["end"] + 0.05 and abs(item["factor"] - merged[-1]["factor"]) < 0.01:
+            merged[-1]["end"] = max(merged[-1]["end"], item["end"])
+        else:
+            if merged and item["start"] < merged[-1]["end"]:
+                item["start"] = merged[-1]["end"]
+            if item["end"] > item["start"] + 0.05:
+                merged.append(item)
+    return merged
+
+
+def markers_to_segments(markers, duration, default_factor=15.0):
+    merged = normalize_speedup_markers(markers, duration, default_factor=default_factor)
+    if not merged:
+        return None
+    segs, cur = [], 0.0
+    for m in merged:
+        if m["start"] > cur + 0.02:
+            segs.append((cur, m["start"], 1.0))
+        segs.append((m["start"], m["end"], float(m["factor"])))
+        cur = m["end"]
+    if duration > cur + 0.02:
+        segs.append((cur, float(duration), 1.0))
+    return segs
+
+
+def load_segments_json(folder):
+    if not folder:
+        return {"version": 1, "default_factor": 15.0, "clips": {}}
+    seg_path = Path(folder) / "segments.json"
+    if not seg_path.is_file():
+        return {"version": 1, "default_factor": 15.0, "clips": {}}
+    try:
+        data = json.loads(seg_path.read_text(encoding="utf-8"))
+        data.setdefault("version", 1)
+        data.setdefault("default_factor", 15.0)
+        data.setdefault("clips", {})
+        return data
+    except Exception as exc:
+        print(f"Warning: could not parse {seg_path}: {exc}")
+        return {"version": 1, "default_factor": 15.0, "clips": {}}
+
+
 def compress_silent_video(video_path, segments, factor, out_w=None, out_h=None, fps=None):
-    """
-    Compress silent segments of a 1x action-camera clip by factor using smooth frame blending (tblend/setpts).
-    Spoken commentary segments (sp <= 1.0) stay at 1x, keeping FIT telemetry aligned.
-    Returns (compressed_path, new_segments, was_compressed).
-    """
-    has_silent = any(sp > 1.0 for _, _, sp in segments)
+    norm_segs = [(seg[0], seg[1], seg[2], seg[3] if len(seg) > 3 else seg[2]) for seg in segments]
+    has_silent = any((sp > 1.0 or sp == 0.0) for _, _, sp, _ in norm_segs)
     if not has_silent or factor <= 1.0:
         return video_path, segments, False
-
     src_w, src_h, src_fps = get_video_size_fps(video_path)
-    target_fps = fps or src_fps or 30.0
-    if abs(target_fps - 29.97) < 0.05 or abs(target_fps - 59.94) < 0.05:
-        target_fps = 30.0
-    else:
-        target_fps = max(1.0, round(target_fps, 3))
-
+    target_fps = float(fps or src_fps or 30.0)
+    scale_prefix = f"scale={out_w}:{out_h}," if (out_w and out_h and (src_w != out_w or src_h != out_h)) else ""
     has_audio = has_audio_stream(video_path)
+    seg_dir = tempfile.mkdtemp(prefix="comp_segs_")
     tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-
-    vf_parts = []
-    af_parts = []
-    concat_inputs = []
-    new_segments = []
-    cur_comp_t = 0.0
-
-    for i, (s, e, sp) in enumerate(segments):
-        orig_dur = e - s
-        if orig_dur <= 0.001:
-            continue
-        if sp > 1.0:
-            f = float(sp)
-            comp_dur = orig_dur / f
-            vf_parts.append(
-                f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,"
-                f"tblend=all_mode=average,setpts=PTS/{f:.6f},fps={target_fps}[v{i}]"
-            )
-            af_parts.append(f"anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a{i}]")
-            new_segments.append((cur_comp_t, cur_comp_t + comp_dur, f))
-            cur_comp_t += comp_dur
-        else:
-            comp_dur = orig_dur
-            vf_parts.append(
-                f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,fps={target_fps}[v{i}]"
-            )
-            if has_audio:
-                af_parts.append(
-                    f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
-                )
+    seg_files, new_segments, cur_comp_t = [], [], 0.0
+    valid_segs = [(s, e, sp, tsp) for s, e, sp, tsp in norm_segs if (e - s) > 0.05]
+    print(f"Compressing marked speedup sections ({len(valid_segs)} segments sequentially)...")
+    try:
+        for i, (s, e, sp, tsp) in enumerate(valid_segs):
+            orig_dur = e - s
+            print(f"  [{i+1}/{len(valid_segs)}] Encoding {sp:g}x segment {s:.1f}-{e:.1f}s ({orig_dur:.1f}s)...", flush=True)
+            seg_dst = os.path.join(seg_dir, f"seg_{i:03d}.mp4")
+            if sp == 0.0:
+                # Cut segment: omit from output video while advancing real_t by orig_dur * tsp
+                new_segments.append((cur_comp_t, cur_comp_t, 0.0, float(tsp)))
+                continue
+            elif sp > 1.0:
+                f = float(sp)
+                comp_dur = orig_dur / f
+                vf = f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,{scale_prefix}tblend=all_mode=average,setpts=PTS/{f:.6f},fps={target_fps},format=yuv420p,setsar=1[v]"
+                fc = f"{vf};anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a]"
+                new_segments.append((cur_comp_t, cur_comp_t + comp_dur, float(tsp) / max(comp_dur, 1e-6)))
             else:
-                af_parts.append(f"anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a{i}]")
-            new_segments.append((cur_comp_t, cur_comp_t + comp_dur, 1.0))
+                comp_dur = orig_dur
+                vf = f"[0:v]trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS,{scale_prefix}fps={target_fps},format=yuv420p,setsar=1[v]"
+                af = f"[0:a]atrim=start={s:.6f}:end={e:.6f},asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo[a]" if has_audio else f"anullsrc=r=48000:cl=stereo:d={comp_dur:.6f}[a]"
+                fc = f"{vf};{af}"
+                new_segments.append((cur_comp_t, cur_comp_t + comp_dur, float(tsp) / max(comp_dur, 1e-6)))
             cur_comp_t += comp_dur
-        concat_inputs.append(f"[v{i}][a{i}]")
-
-    if not concat_inputs:
-        return video_path, segments, False
-
-    n_segs = len(concat_inputs)
-    concat_str = "".join(concat_inputs) + f"concat=n={n_segs}:v=1:a=1[outv][outa]"
-    all_filters = ";".join(vf_parts + af_parts) + ";" + concat_str
-
-    print(f"Compressing silent 1x sections ({n_segs} segments) by {factor:g}x with smooth frame blending (tblend/setpts)...")
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-filter_complex", all_filters,
-        "-map", "[outv]", "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-video_track_timescale", "90000",
-        "-c:a", "aac",
-        tmp_out,
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    print(f"Compressed 1x video: {get_media_duration(video_path):.1f}s -> {cur_comp_t:.1f}s")
-    return tmp_out, new_segments, True
+            subprocess.run(["ffmpeg", "-y", "-i", video_path, "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-video_track_timescale", "90000", "-c:a", "aac", "-t", f"{comp_dur:.6f}", seg_dst], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            seg_files.append(seg_dst)
+        list_txt = os.path.join(seg_dir, "list.txt")
+        with open(list_txt, "w", encoding="utf-8") as lf:
+            for sf in seg_files:
+                safe_sf = os.path.abspath(sf).replace("'", "'\''")
+                lf.write("file '" + safe_sf + "'" + chr(10))
+        subprocess.run(["ffmpeg", "-y", "-fflags", "+genpts", "-f", "concat", "-safe", "0", "-i", list_txt, "-c", "copy", tmp_out], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        print(f"Compressed marked video: {get_media_duration(video_path):.1f}s -> {cur_comp_t:.1f}s")
+        return tmp_out, new_segments, True
+    finally:
+        for sf in seg_files:
+            if os.path.exists(sf):
+                os.remove(sf)
+        if os.path.exists(os.path.join(seg_dir, "list.txt")):
+            os.remove(os.path.join(seg_dir, "list.txt"))
+        try:
+            os.rmdir(seg_dir)
+        except OSError:
+            pass
 
 
-# ============================================================
-# Hyperlapse audio detection
-# ============================================================
 def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, factor=15.0):
     if is_phone_video(video_path):
         dur = get_media_duration(video_path)
@@ -724,7 +756,13 @@ def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, fact
 def build_time_map(segments):
     boundaries = []
     real_t = 0.0
-    for start, end, speed in segments:
+    for seg in segments:
+        start, end, speed = seg[0], seg[1], seg[2]
+        cut_real = seg[3] if len(seg) > 3 else 0.0
+        if end <= start + 1e-6 and cut_real > 0:
+            boundaries.append((start, real_t, 0.0))
+            real_t += cut_real
+            continue
         boundaries.append((start, real_t, speed))
         real_t += (end - start) * speed
     boundaries.append((segments[-1][1], real_t, 1))
@@ -1709,7 +1747,8 @@ def concat_videos(video_paths, output_path, transition_seconds=0.0):
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file.name,
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
                 output_path,
             ]
             print("Concatenating clips (hard cuts, no transition)...")
@@ -1758,7 +1797,8 @@ def concat_videos(video_paths, output_path, transition_seconds=0.0):
                 "-f", "concat",
                 "-safe", "0",
                 "-i", list_file.name,
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
                 output_path,
             ]
             print("Concatenating faded clips...")
@@ -1782,7 +1822,8 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
                      extra_offset, auto_align, offset_explicit, factor,
                      time_mode, utc_offset,
                      phone_priority=True, phone_vertical="blur",
-                     keep_camera_audio=False, compress_silent=False):
+                     keep_camera_audio=False, compress_silent=False,
+                     segments_json_data=None, dry_run=False):
     """
     Build ordered render plan: video slices and photos.
     - Phone Video Priority: carves overlapping action-camera video intervals around phone videos
@@ -1791,6 +1832,10 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
     - Action-camera clips with --compress-silent compress silent segments by factor via tblend/setpts.
     - Mid-clip photos: stills falling inside carved slices split those slices.
     """
+    if segments_json_data is None and videos:
+        segments_json_data = load_segments_json(os.path.dirname(os.path.abspath(videos[0])))
+    json_clips = (segments_json_data or {}).get("clips", {})
+    json_default_factor = float((segments_json_data or {}).get("default_factor", factor) or factor)
     ref_video = videos[0] if videos else None
     offset_hours, offset_desc = resolve_display_offset_hours(ref_video, time_mode, utc_offset)
     print(f"Batch display TZ: {offset_desc}")
@@ -1817,15 +1862,50 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
         cap.release()
 
         effective_path = vpath
+        bname = os.path.basename(vpath)
+        marked_list = json_clips.get(bname)
         if is_phone:
-            print(f"  Phone video ({os.path.basename(vpath)}): locked to 1x speed ({duration:.2f}s)")
+            if not dry_run:
+                print(f"  Phone video ({bname}): locked to 1x speed ({duration:.2f}s)")
             segments = [(0.0, duration, 1.0)]
+        elif marked_list:
+            # Apply user segments.json markers directly so ONLY marked intervals are sped up or cut (never 225x)
+            base_segs = detect_speed_segments(vpath, factor=factor)
+            user_segs = markers_to_segments(marked_list, duration, default_factor=json_default_factor) or [(0.0, duration, 1.0)]
+            raw_segments = []
+            for us, ue, usp in user_segs:
+                exact_real = 0.0
+                covered = 0.0
+                for bs, be, sp_b in base_segs:
+                    ov0, ov1 = max(bs, us), min(be, ue)
+                    if ov1 > ov0:
+                        exact_real += (ov1 - ov0) * float(sp_b)
+                        covered += (ov1 - ov0)
+                if (ue - us) > covered:
+                    exact_real += ((ue - us) - covered) * 1.0
+                raw_segments.append((us, ue, float(usp), exact_real))
+            if dry_run:
+                est_segs, cur_t = [], 0.0
+                for seg0 in raw_segments:
+                    s0, e0, sp0 = seg0[0], seg0[1], seg0[2]
+                    exact_r = float(seg0[3]) if len(seg0) > 3 else (e0 - s0) * float(sp0)
+                    if float(sp0) == 0.0:
+                        est_segs.append((cur_t, cur_t, 0.0, exact_r))
+                    else:
+                        d0 = (e0 - s0) / float(sp0)
+                        est_segs.append((cur_t, cur_t + d0, exact_r / max(d0, 1e-6)))
+                        cur_t += d0
+                segments, duration = est_segs, cur_t
+            else:
+                print(f"  Applying {len(marked_list)} speedup marker(s) from segments.json on {bname}...")
+                comp_path, new_segments, _ = compress_silent_video(vpath, raw_segments, json_default_factor)
+                effective_path, segments = comp_path, new_segments
+                duration = segments[-1][1] if segments else duration
         else:
-            if compress_silent:
+            if compress_silent and not dry_run:
                 raw_segments = detect_speed_segments(vpath, factor=factor)
-                comp_path, new_segments, was_comp = compress_silent_video(vpath, raw_segments, factor)
-                effective_path = comp_path
-                segments = new_segments
+                comp_path, new_segments, _ = compress_silent_video(vpath, raw_segments, factor)
+                effective_path, segments = comp_path, new_segments
                 duration = segments[-1][1] if segments else duration
             else:
                 segments = detect_speed_segments(vpath, factor=factor)
