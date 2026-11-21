@@ -1912,16 +1912,29 @@ def build_batch_plan(videos, photos, fit_path, records, start_time, gps_points,
             user_segs = markers_to_segments(marked_list, duration, default_factor=json_default_factor) or [(0.0, duration, 1.0)]
             raw_segments = []
             for us, ue, usp in user_segs:
-                exact_real = 0.0
-                covered = 0.0
-                for bs, be, sp_b in base_segs:
-                    ov0, ov1 = max(bs, us), min(be, ue)
-                    if ov1 > ov0:
-                        exact_real += (ov1 - ov0) * float(sp_b)
-                        covered += (ov1 - ov0)
-                if (ue - us) > covered:
-                    exact_real += ((ue - us) - covered) * 1.0
-                raw_segments.append((us, ue, float(usp), exact_real))
+                if float(usp) == 1.0:
+                    # Keep native 1x vs 15x sub-segments intact so clock never averages across spoken stops
+                    cur_u = us
+                    for bs, be, sp_b in base_segs:
+                        ov0, ov1 = max(bs, cur_u), min(be, ue)
+                        if ov1 > ov0 + 0.01:
+                            if ov0 > cur_u + 0.01:
+                                raw_segments.append((cur_u, ov0, 1.0, (ov0 - cur_u) * 1.0))
+                            raw_segments.append((ov0, ov1, 1.0, (ov1 - ov0) * float(sp_b)))
+                            cur_u = ov1
+                    if ue > cur_u + 0.01:
+                        raw_segments.append((cur_u, ue, 1.0, (ue - cur_u) * 1.0))
+                else:
+                    exact_real = 0.0
+                    covered = 0.0
+                    for bs, be, sp_b in base_segs:
+                        ov0, ov1 = max(bs, us), min(be, ue)
+                        if ov1 > ov0:
+                            exact_real += (ov1 - ov0) * float(sp_b)
+                            covered += (ov1 - ov0)
+                    if (ue - us) > covered:
+                        exact_real += ((ue - us) - covered) * 1.0
+                    raw_segments.append((us, ue, float(usp), exact_real))
             if dry_run:
                 est_segs, cur_t = [], 0.0
                 for seg0 in raw_segments:
