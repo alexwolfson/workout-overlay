@@ -827,6 +827,10 @@ class DebugApp(ctk.CTk):
         if wo.is_phone_video(self.current_path):
             self.log("Phone videos stay at 1x speed")
             return
+        t_chk = self._current_file_t()
+        if mode == "speedup" and factor_at(self.segments, t_chk) > 1.01:
+            self.log("Already 15× Hyperlapse here — use Cut In [X] instead!")
+            return
         t = round(self._current_file_t(), 2)
         self._pending_in = (t, mode)
         tag = "CUT" if mode == "cut" else "15×"
