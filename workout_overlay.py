@@ -735,12 +735,13 @@ def detect_speed_segments(video_path, threshold_db=None, min_segment_s=1.0, fact
         trimmed = samples[: n_hops * hop].reshape(n_hops, hop)
         rms = np.sqrt(np.mean(trimmed * trimmed, axis=1))
         times = (np.arange(n_hops, dtype=np.float64) * hop) / float(sr)
-        rms = np.maximum(rms, 1e-10)
+        # Clamp at 1 LSB of 16-bit PCM (1/32768) so zero-padded packets don't skew percentiles to -200 dB
+        rms = np.maximum(rms, 1.0 / 32768.0)
         rms_db = 20.0 * np.log10(rms)
         p10 = float(np.percentile(rms_db, 10))
-        p50 = float(np.percentile(rms_db, 50))
+        p90 = float(np.percentile(rms_db, 90))
         if threshold_db is None:
-            threshold_db = p10 + 0.35 * (p50 - p10)
+            threshold_db = p10 + 0.30 * (p90 - p10)
         enter_silence = threshold_db - 1.5
         leave_silence = threshold_db + 1.5
         print(f"Audio threshold: {threshold_db:.1f} dB  | silent factor={factor:g}x")
