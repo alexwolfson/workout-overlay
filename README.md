@@ -256,3 +256,9 @@ Use `debug_gui.py` to trim long rides or dives down to a tight **2–5 minute** 
    - **Live `Est. Output` counter**: Tracks predicted final runtime in the top bar (turning green inside the **2–5 minute** target window).
 3. **Render automatically with `./run_overlay.sh`:**
    - Markers are saved automatically to `<workout_folder>/segments.json` and applied whenever you run `./run_overlay.sh --batch /path/to/workout_folder`.
+
+## Hardware Acceleration & Performance (`v1.3.1`)
+
+- **Auto-VAAPI GPU Encoding (Default):** Automatically detects `/dev/dri/renderD128` (`h264_vaapi`, `-qp 26`) on AMD and Intel Linux GPUs, falling back automatically to `libx264 -preset faster` when VAAPI is unavailable.
+- **High-Quality CPU Archive Mode (`--hq`):** Pass `--hq` to force `libx264 -preset medium -crf 19`.
+- **Render Timer:** Every run prints total elapsed wall-clock time and active encoder mode at completion.

@@ -13,6 +13,8 @@ Batch (one FIT + MP4s and/or photos):
 import argparse
 import json
 import os
+import time
+import time
 import re
 import subprocess
 import tempfile
@@ -549,6 +551,48 @@ def normalize_phone_video_clip(
     return dst_video_path
 
 
+_VAAPI_CACHE = None
+_USE_HQ_ENCODE = False
+
+
+def get_vaapi_device():
+    global _VAAPI_CACHE
+    if _VAAPI_CACHE is not None:
+        return _VAAPI_CACHE if _VAAPI_CACHE else None
+    dev = "/dev/dri/renderD128"
+    if not os.path.exists(dev):
+        _VAAPI_CACHE = ""
+        return None
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-vaapi_device", dev,
+                "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                "-vf", "format=nv12,hwupload",
+                "-c:v", "h264_vaapi", "-f", "null", "-",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        _VAAPI_CACHE = dev if res.returncode == 0 else ""
+    except Exception:
+        _VAAPI_CACHE = ""
+    if _VAAPI_CACHE:
+        print(f"Hardware encoding: enabled VAAPI GPU ({_VAAPI_CACHE})", flush=True)
+    else:
+        print("Hardware encoding: VAAPI unavailable, using fast CPU (libx264 -preset faster)", flush=True)
+    return _VAAPI_CACHE if _VAAPI_CACHE else None
+
+
+def video_encode_params():
+    if _USE_HQ_ENCODE:
+        return [], "", ["-c:v", "libx264", "-preset", "medium", "-crf", "19"]
+    dev = get_vaapi_device()
+    if dev:
+        return ["-vaapi_device", dev], ",format=nv12,hwupload", ["-c:v", "h264_vaapi", "-qp", "26"]
+    return [], "", ["-c:v", "libx264", "-preset", "faster", "-crf", "22"]
+
+
 def normalize_speedup_markers(markers, duration, default_factor=15.0):
     valid = []
     for m in markers or []:
@@ -640,7 +684,9 @@ def compress_silent_video(video_path, segments, factor, out_w=None, out_h=None, 
                 fc = f"{vf};{af}"
                 new_segments.append((cur_comp_t, cur_comp_t + comp_dur, float(tsp) / max(comp_dur, 1e-6)))
             cur_comp_t += comp_dur
-            subprocess.run(["ffmpeg", "-y", "-i", video_path, "-filter_complex", fc, "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-video_track_timescale", "90000", "-c:a", "aac", "-t", f"{comp_dur:.6f}", seg_dst], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            v_pre, v_suf, v_cod = video_encode_params()
+            fc_enc = fc.replace("[v]", f"{v_suf}[v]") if v_suf else fc
+            subprocess.run(["ffmpeg", "-y"] + v_pre + ["-i", video_path, "-filter_complex", fc_enc, "-map", "[v]", "-map", "[a]"] + v_cod + ["-video_track_timescale", "90000", "-avoid_negative_ts", "make_zero", "-c:a", "aac", "-t", f"{comp_dur:.6f}", seg_dst], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             seg_files.append(seg_dst)
         list_txt = os.path.join(seg_dir, "list.txt")
         with open(list_txt, "w", encoding="utf-8") as lf:
@@ -1459,16 +1505,33 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
                 break
 
             if preview and (frame.shape[1] != out_w or frame.shape[0] != out_h):
-                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+                frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
             idx = int(round(t / step))
             idx = max(0, min(idx, len(times) - 1))
             if idx not in cache:
-                cache[idx] = make_overlay_rgba(
+                ov_rgba = make_overlay_rgba(
                     idx, arrays, clock,
                     gps_points, out_w, out_h, fonts, offset_hours, sport=sport,
                 )
-            writer.write(alpha_blend(frame, cache[idx]))
+                ys, xs = np.nonzero(ov_rgba[:, :, 3])
+                if len(ys) > 0:
+                    y0, y1 = int(ys.min()), int(ys.max()) + 1
+                    x0, x1 = int(xs.min()), int(xs.max()) + 1
+                    sub = ov_rgba[y0:y1, x0:x1]
+                    a = (sub[:, :, 3:4].astype(np.float32)) * (1.0 / 255.0)
+                    # Convert RGBA -> BGR premultiplied float32 once per step
+                    bgr = sub[:, :, 2::-1].astype(np.float32) * a
+                    inv_a = 1.0 - a
+                    cache[idx] = (y0, y1, x0, x1, bgr, inv_a)
+                else:
+                    cache[idx] = None
+            entry = cache[idx]
+            if entry is not None:
+                y0, y1, x0, x1, bgr, inv_a = entry
+                roi = frame[y0:y1, x0:x1].astype(np.float32)
+                frame[y0:y1, x0:x1] = (bgr + roi * inv_a).astype(np.uint8)
+            writer.write(frame)
             frames_written += 1
             if frames_written % 300 == 0:
                 print(f"  slice frames {frames_written} (t≈{t:.1f}s)")
@@ -1488,36 +1551,23 @@ def create_overlay(video_path, fit_path, output_path, extra_offset=0.0,
                 f"asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo,"
                 f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={max(0.0, dur - fade_dur):.3f}:d={fade_dur:.3f}"
             )
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", tmp_video,
-                "-i", video_path,
-                "-ss", f"{t0:.6f}",
-                "-to", f"{t1:.6f}",
-                "-map", "0:v:0",
-                "-map", "1:a:0",
+            v_pre, v_suf, v_cod = video_encode_params()
+            cmd = ["ffmpeg", "-y"] + v_pre + [
+                "-i", tmp_video, "-i", video_path,
+                "-ss", f"{t0:.6f}", "-to", f"{t1:.6f}",
+                "-map", "0:v:0", "-map", "1:a:0",
+            ] + (["-vf", v_suf.lstrip(",")] if v_suf else []) + [
                 "-af", af,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                "-c:a", "aac",
-                "-shortest",
-                output_path,
-            ]
+            ] + v_cod + ["-video_track_timescale", "90000", "-c:a", "aac", "-shortest", output_path]
         else:
             af = f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur - fade_dur:.3f}:d={fade_dur:.3f}"
-            cmd = [
-                "ffmpeg", "-y",
+            v_pre, v_suf, v_cod = video_encode_params()
+            cmd = ["ffmpeg", "-y"] + v_pre + [
                 "-i", tmp_video,
                 "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur:.6f}",
+            ] + (["-vf", v_suf.lstrip(",")] if v_suf else []) + [
                 "-af", af,
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "23",
-                "-c:a", "aac",
-                "-shortest",
-                output_path,
-            ]
+            ] + v_cod + ["-video_track_timescale", "90000", "-c:a", "aac", "-shortest", output_path]
         subprocess.run(cmd, check=True)
         os.remove(tmp_video)
         print(f"\nDone clip → {output_path}")
@@ -1565,18 +1615,13 @@ def create_photo_clip(photo_path, output_path, records, start_time, gps_points,
     dur_f = float(photo_seconds)
     fade_dur = min(0.02, dur_f / 2.0)
     af = f"afade=t=in:st=0:d={fade_dur:.3f},afade=t=out:st={dur_f - fade_dur:.3f}:d={fade_dur:.3f}"
-    cmd = [
-        "ffmpeg", "-y",
+    v_pre, v_suf, v_cod = video_encode_params()
+    cmd = ["ffmpeg", "-y"] + v_pre + [
         "-i", tmp_video,
         "-f", "lavfi", "-i", f"anullsrc=channel_layout=stereo:sample_rate=48000:d={dur_f:.6f}",
+    ] + (["-vf", v_suf.lstrip(",")] if v_suf else []) + [
         "-af", af,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-shortest",
-        output_path,
-    ]
+    ] + v_cod + ["-video_track_timescale", "90000", "-c:a", "aac", "-shortest", output_path]
     subprocess.run(cmd, check=True)
     os.remove(tmp_video)
     print(f"Done photo → {output_path} ({photo_seconds}s @ {photo_dt})")
@@ -1707,17 +1752,9 @@ def _prepare_clip_fade_black(src, dst, width, height, fps, fade_in, fade_out):
         af_parts.append(f"afade=t=out:st={st:.6f}:d={fade_out:.6f}")
     af_str = ",".join(af_parts) if af_parts else "anull"
 
-    cmd = [
-        "ffmpeg", "-y", "-i", src,
-        "-vf", vf_str,
-        "-af", af_str,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-ar", "48000",
-        "-ac", "2",
-        dst,
+    v_pre, v_suf, v_cod = video_encode_params()
+    cmd = ["ffmpeg", "-y"] + v_pre + ["-i", src, "-vf", vf_str + v_suf, "-af", af_str] + v_cod + [
+        "-video_track_timescale", "90000", "-c:a", "aac", "-ar", "48000", "-ac", "2", dst,
     ]
     subprocess.run(cmd, check=True)
 
@@ -2289,7 +2326,11 @@ def main():
                    help="Route action-camera audio onto overlapping phone clips (default: off)")
     p.add_argument("--compress-silent", action="store_true", default=False,
                    help="Compress silent segments in 1x action-camera clips by --factor using tblend/setpts (default: off)")
+    p.add_argument("--hq", action="store_true", help="High-quality CPU archive encode (libx264 -preset medium) instead of default GPU VAAPI / faster CPU")
     args = p.parse_args()
+    global _USE_HQ_ENCODE
+    _USE_HQ_ENCODE = bool(getattr(args, "hq", False))
+    _render_t0 = time.monotonic()
 
     offset_explicit = args.offset is not None
     extra_offset = 0.0 if args.offset is None else args.offset
@@ -2307,6 +2348,12 @@ def main():
             phone_priority=args.phone_priority, phone_vertical=args.phone_vertical,
             keep_camera_audio=args.keep_camera_audio, compress_silent=args.compress_silent,
         )
+        _elapsed = time.monotonic() - _render_t0
+        _mins, _secs = divmod(int(round(_elapsed)), 60)
+        _hrs, _mins = divmod(_mins, 60)
+        _dur_str = f"{_hrs}h {_mins:02d}m {_secs:02d}s" if _hrs else f"{_mins}m {_secs:02d}s"
+        _mode_str = "HQ CPU (libx264 medium)" if _USE_HQ_ENCODE else ("VAAPI GPU" if _VAAPI_CACHE else "Fast CPU (libx264 faster)")
+        print(f"Total render time: {_dur_str} ({_elapsed:.1f}s) | Encoder: {_mode_str}", flush=True)
         return
 
     if not args.video or not args.fit:
@@ -2321,6 +2368,13 @@ def main():
         factor=args.factor, sport=sport,
         phone_vertical=args.phone_vertical, compress_silent=args.compress_silent,
     )
+
+    _elapsed = time.monotonic() - _render_t0
+    _mins, _secs = divmod(int(round(_elapsed)), 60)
+    _hrs, _mins = divmod(_mins, 60)
+    _dur_str = f"{_hrs}h {_mins:02d}m {_secs:02d}s" if _hrs else f"{_mins}m {_secs:02d}s"
+    _mode_str = "HQ CPU (libx264 medium)" if _USE_HQ_ENCODE else ("VAAPI GPU" if _VAAPI_CACHE else "Fast CPU (libx264 faster)")
+    print(f"Total render time: {_dur_str} ({_elapsed:.1f}s) | Encoder: {_mode_str}", flush=True)
 
 
 if __name__ == "__main__":
